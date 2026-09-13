@@ -901,6 +901,36 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_tenant ON tasks(tenant)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_idempotency ON tasks(idempotency_key)")
+    # Preserve the newest active owner of each key, then enforce exactly-once
+    # creation at the storage boundary. Archived cards release their keys.
+    duplicate_rows = conn.execute(
+        """
+        UPDATE tasks SET idempotency_key = NULL
+        WHERE rowid IN (
+            SELECT older.rowid
+            FROM tasks AS older
+            JOIN tasks AS newer
+              ON newer.idempotency_key = older.idempotency_key
+             AND newer.status != 'archived'
+             AND older.status != 'archived'
+             AND (
+                 newer.created_at > older.created_at
+                 OR (newer.created_at = older.created_at AND newer.rowid > older.rowid)
+             )
+            WHERE older.idempotency_key IS NOT NULL
+        )
+        """
+    ).rowcount
+    if duplicate_rows > 0:
+        _kb._log.warning(
+            "detached idempotency keys from %d older duplicate Kanban task(s)",
+            duplicate_rows,
+        )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_idempotency_unique_active "
+        "ON tasks(idempotency_key) "
+        "WHERE idempotency_key IS NOT NULL AND status != 'archived'"
+    )
     conn.execute("CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)")
 
     # task_events.run_id back-fills as NULL for historical events (they predate

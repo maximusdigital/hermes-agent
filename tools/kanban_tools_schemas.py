@@ -438,6 +438,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "exists, return that task's id instead of creating "
                 "a duplicate. Useful for retry-safe automation."
         )),
+        "assignment_id": _prop("string", (
+                "Stable assignment identifier within one inbound message. "
+                "Use distinct values when creating multiple tasks for the same "
+                "assignee; retries must reuse the same value."
+        )),
         "max_runtime_seconds": _prop("integer", (
                 "Per-task runtime cap. When exceeded, the "
                 "dispatcher SIGTERMs the worker and re-queues the "

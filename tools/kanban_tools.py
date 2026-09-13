@@ -38,25 +38,11 @@ def _profile_has_kanban_toolset() -> bool:
     from tools.kanban_toolset_context import kanban_toolset_requested
 
     requested = kanban_toolset_requested()
-    if requested:
-        return True
+    if requested is not None:
+        return requested
     try:
         config = load_config()
-        # Preserve the legacy profile-wide opt-in for callers using bundles.
-        if "kanban" in (config.get("toolsets") or []):
-            return True
-        if requested is not None:
-            # Never borrow another platform's opt-in during schema assembly.
-            return False
-        # Offer-time skill discovery has no platform selection. A saved opt-in
-        # makes the playbook relevant; actual schemas still use the scope above.
-        from hermes_cli.tools_config import _get_platform_tools
-
-        platforms = config.get("platform_toolsets") or {}
-        return any(
-            "kanban" in _get_platform_tools(config, platform, include_default_mcp_servers=False)
-            for platform, names in platforms.items() if isinstance(names, list)
-        )
+        return "kanban" in (config.get("toolsets") or [])
     except Exception:
         return False
 
@@ -1011,6 +997,63 @@ def _persisted_session_id(session_id: Optional[str]) -> Optional[str]:
         state.close()
 
 
+def _derived_create_idempotency_key(args: dict, assignee: str) -> Optional[str]:
+    """Return a stable key for one worker or inbound-message assignment."""
+    import hashlib
+    import unicodedata
+
+    from gateway.session_context import get_session_env
+    from hermes_cli.profiles import normalize_profile_name
+
+    caller_key = args.get("idempotency_key")
+    assignment = args.get("assignment_id")
+    if assignment is not None:
+        assignment_id = unicodedata.normalize("NFKC", str(assignment)).strip().casefold()
+    elif caller_key is not None:
+        normalized = unicodedata.normalize("NFKC", str(caller_key)).strip()
+        assignment_id = f"caller:{normalized}"
+    else:
+        assignment_id = f"assignee:{normalize_profile_name(str(assignee))}"
+    _check(assignment_id and assignment_id != "caller:",
+           "assignment_id/idempotency_key cannot be empty")
+
+    profile = normalize_profile_name(
+        get_session_env("HERMES_SESSION_PROFILE", "")
+        or os.environ.get("HERMES_PROFILE")
+        or "default"
+    )
+    worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if worker_task_id:
+        identity = {
+            "profile": profile,
+            "parent_task_id": str(worker_task_id),
+            "assignment_id": assignment_id,
+        }
+        prefix = "worker:v2:"
+    else:
+        platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+        thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "")
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "")
+        inbound = any((platform, chat_id, message_id))
+        _check(not inbound or all((platform, chat_id, message_id)),
+               "incomplete inbound event identity; platform, chat_id, and message_id are required")
+        if not inbound:
+            return str(caller_key).strip() if caller_key is not None else None
+        identity = {
+            "profile": profile,
+            "platform": str(platform).strip().casefold(),
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id),
+            "message_id": str(message_id),
+            "assignment_id": assignment_id,
+        }
+        prefix = "inbound:v2:"
+
+    encoded = json.dumps(identity, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+    return prefix + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
 @_kanban_handler("kanban_create")
 def _handle_create(args: dict, **kw) -> str:
     """Create a (child) task; orchestrator workers use this to fan out."""
@@ -1033,6 +1076,8 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    idempotency_key = _derived_create_idempotency_key(args, str(assignee))
+    notify_sub = _auto_subscription_args()
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1060,18 +1105,39 @@ def _handle_create(args: dict, **kw) -> str:
             board=args.get("board"),
             project_source_task_id=project_source_task_id, triage=triage,
             creator_task_id=self_tid,
-            idempotency_key=args.get("idempotency_key"),
+            idempotency_key=idempotency_key,
             max_runtime_seconds=_opt_int(args.get("max_runtime_seconds")), skills=skills,
             model_override=model_override, provider_override=provider_override,
             goal_mode=goal_mode, goal_max_turns=_opt_int(args.get("goal_max_turns")),
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
-            created_by=_persisted_identity(), session_id=session_id)
+            created_by=_persisted_identity(), session_id=session_id,
+            notify_sub=notify_sub)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
         wait = [e for e in kb.list_events(conn, new_tid) if e.kind == "dependency_wait"]
         gate = {"gated": True, "gated_by": wait[-1].payload["parent"]} if wait else {"gated": False}
         return _ok(task_id=new_tid, **landed, **gate,
-                   subscribed=_maybe_auto_subscribe(conn, new_tid))
+                   subscribed=notify_sub is not None)
+
+
+def _auto_subscription_args() -> Optional[dict[str, Any]]:
+    """Build the durable return route before task creation, failing closed for gateways."""
+    enabled = True
+    try:
+        enabled = bool(cfg_get(load_config(), "kanban", "auto_subscribe_on_create", default=True))
+    except Exception:
+        pass
+
+    from gateway.session_context import get_session_env
+
+    platform = get_session_env("HERMES_SESSION_PLATFORM", "")
+    chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
+    if not enabled:
+        _check(not (platform or chat_id),
+               "gateway task creation requires kanban.auto_subscribe_on_create=true "
+               "so the result route is durable")
+        return None
+    return _resolve_notify_target()
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

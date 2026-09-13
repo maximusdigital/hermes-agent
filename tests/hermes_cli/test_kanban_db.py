@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -17,6 +19,7 @@ import hermes_state_wal
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import kanban_db_workspace as kbw
 
 
@@ -173,10 +176,147 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_create_task_idempotency_is_atomic_across_connections(kanban_home):
+    workers = 12
+    barrier = threading.Barrier(workers)
+
+    def create_once(_index):
+        with kb.connect() as conn:
+            barrier.wait(timeout=5)
+            return kb.create_task(
+                conn,
+                title="same inbound assignment",
+                assignee="monika",
+                idempotency_key="telegram:default:chat-1:message-7:assignment-0",
+            )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        task_ids = list(pool.map(create_once, range(workers)))
+
+    assert len(set(task_ids)) == 1
+    with kb.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+            ("telegram:default:chat-1:message-7:assignment-0",),
+        ).fetchone()[0]
+    assert count == 1
+
+
+def test_create_task_rolls_back_when_origin_subscription_fails(
+    kanban_home, monkeypatch
+):
+    conn = kb.connect()
+
+    def fail_subscription(*args, **kwargs):
+        raise RuntimeError("subscription failed")
+
+    monkeypatch.setattr(kbn, "add_notify_sub", fail_subscription)
+
+    with pytest.raises(RuntimeError, match="subscription failed"):
+        kb.create_task(
+            conn,
+            title="Atomic route",
+            assignee="neo",
+            idempotency_key="origin-atomic",
+            notify_sub={"platform": "telegram", "chat_id": "42"},
+        )
+
+    assert conn.execute(
+        "SELECT COUNT(*) FROM tasks WHERE idempotency_key = ?",
+        ("origin-atomic",),
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_active_idempotency_key_has_partial_unique_index(kanban_home):
+    with kb.connect() as conn:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_tasks_idempotency_unique_active'"
+        ).fetchone()
+
+    assert row is not None
+    sql = row["sql"].upper()
+    assert "UNIQUE" in sql
+    assert "STATUS != 'ARCHIVED'" in sql
+
+
+def test_migration_preserves_duplicate_tasks_but_detaches_older_key(kanban_home):
+    db_path = kb.kanban_db_path()
+    with kb.connect() as conn:
+        conn.execute("DROP INDEX idx_tasks_idempotency_unique_active")
+        conn.execute(
+            "INSERT INTO tasks "
+            "(id, title, assignee, status, created_at, workspace_kind, idempotency_key) "
+            "VALUES ('older', 'older task', 'monika', 'ready', 1, 'scratch', 'dup-key'), "
+            "('newer', 'newer task', 'monika', 'ready', 2, 'scratch', 'dup-key')"
+        )
+
+    kb.init_db(db_path)
+
+    with kb.connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id, idempotency_key FROM tasks ORDER BY created_at"
+        ).fetchall()
+        index = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type = 'index' AND name = 'idx_tasks_idempotency_unique_active'"
+        ).fetchone()
+
+    assert [(row["id"], row["idempotency_key"]) for row in rows] == [
+        ("older", None),
+        ("newer", "dup-key"),
+    ]
+    assert index is not None
+
+
+def test_archived_idempotency_key_can_be_reused(kanban_home):
+    with kb.connect() as conn:
+        first = kb.create_task(
+            conn, title="first", assignee="monika", idempotency_key="reusable-key"
+        )
+        assert kb.archive_task(conn, first)
+        second = kb.create_task(
+            conn, title="replacement", assignee="monika", idempotency_key="reusable-key"
+        )
+
+    assert second != first
+
 
 # ---------------------------------------------------------------------------
 # Links + dependency resolution
 # ---------------------------------------------------------------------------
+
+
+def test_todo_task_can_only_be_explicitly_blocked_as_dependency(kanban_home):
+    with kb.connect() as conn:
+        prerequisite_id = kb.create_task(conn, title="Prerequisite")
+        task_id = kb.create_task(conn, title="Waiting")
+        kb.link_tasks(conn, prerequisite_id, task_id)
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "todo"
+
+        assert not kb.block_task(
+            conn, task_id, reason="need input", kind="needs_input"
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "todo"
+
+
+def test_lead_task_waits_when_delegated_task_is_linked_as_its_parent(kanban_home):
+    with kb.connect() as conn:
+        lead_id = kb.create_task(conn, title="Monika lead", assignee="monika")
+        delegated_id = kb.create_task(conn, title="Neo work", assignee="neo")
+        kb.link_tasks(conn, delegated_id, lead_id)
+        assert kb.block_task(
+            conn, lead_id, reason="waiting for Neo", kind="dependency"
+        )
+        lead = kb.get_task(conn, lead_id)
+        assert lead is not None and lead.status == "todo"
+
+        assert kb.complete_task(conn, delegated_id, summary="verified")
+        lead = kb.get_task(conn, lead_id)
+        assert lead is not None and lead.status == "ready"
 
 
 

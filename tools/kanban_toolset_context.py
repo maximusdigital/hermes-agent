@@ -20,8 +20,9 @@ def kanban_toolset_requested() -> Optional[bool]:
 
 @contextmanager
 def scoped_kanban_toolset_selection(toolsets: Optional[Iterable[str]]) -> Iterator[None]:
-    """An all/default selection is not an explicit workflow opt-in."""
-    token = _requested.set("kanban" in (toolsets or ()))
+    """Scope one schema build to its explicit Kanban selection."""
+    selected = None if toolsets is None else "kanban" in set(toolsets)
+    token = _requested.set(selected)
     try:
         yield
     finally:

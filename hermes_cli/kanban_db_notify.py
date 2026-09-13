@@ -97,7 +97,7 @@ def add_notify_sub(
     # delivery mechanism at all. Explicit modes still win.
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=True):
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,

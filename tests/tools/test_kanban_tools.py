@@ -551,6 +551,268 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_gateway_create_is_idempotent_per_message_assignment(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    args = {"title": "Prepare employee", "assignee": "monika"}
+
+    first = json.loads(kt._handle_create(args))
+    second = json.loads(kt._handle_create(args))
+
+    assert first["task_id"] == second["task_id"]
+
+
+def test_worker_child_creation_is_idempotent_per_parent(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "monika")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "lead-1")
+    args = {"title": "Neo work", "assignee": "neo"}
+
+    first = json.loads(kt._handle_create(args))
+    retry = json.loads(kt._handle_create(args))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "lead-2")
+    separate_parent = json.loads(kt._handle_create(args))
+
+    assert first["task_id"] == retry["task_id"]
+    assert first["task_id"] != separate_parent["task_id"]
+
+
+def test_worker_child_assignments_use_stable_discriminators(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_PROFILE", "monika")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "lead-1")
+    first = json.loads(
+        kt._handle_create(
+            {"title": "Neo work", "assignee": "neo", "assignment_id": "first"}
+        )
+    )
+    second = json.loads(
+        kt._handle_create(
+            {"title": "Neo work", "assignee": "neo", "assignment_id": "second"}
+        )
+    )
+
+    assert first["task_id"] != second["task_id"]
+
+
+def test_gateway_idempotency_is_profile_scoped(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    args = {"title": "Prepare employee", "assignee": "monika"}
+
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "alpha")
+    first = json.loads(kt._handle_create(args))
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "beta")
+    second = json.loads(kt._handle_create(args))
+
+    assert first["task_id"] != second["task_id"]
+    first_subs = _list_subs_for_task(first["task_id"])
+    second_subs = _list_subs_for_task(second["task_id"])
+    assert {sub["notifier_profile"] for sub in first_subs} == {"alpha"}
+    assert {sub["notifier_profile"] for sub in second_subs} == {"beta"}
+
+
+def test_gateway_explicit_key_is_still_profile_scoped(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    args = {
+        "title": "Prepare employee",
+        "assignee": "monika",
+        "idempotency_key": "upstream-request-7",
+    }
+
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "alpha")
+    first = json.loads(kt._handle_create(args))
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "beta")
+    second = json.loads(kt._handle_create(args))
+
+    assert first["task_id"] != second["task_id"]
+
+
+def test_gateway_explicit_key_does_not_bypass_event_validation(
+    monkeypatch, worker_env
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.delenv("HERMES_SESSION_MESSAGE_ID", raising=False)
+
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "Prepare employee",
+                "assignee": "monika",
+                "idempotency_key": "upstream-request-7",
+            }
+        )
+    )
+
+    assert "error" in result
+    assert "event identity" in result["error"]
+
+
+def test_gateway_idempotency_normalizes_assignee(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+
+    first = json.loads(kt._handle_create({
+        "title": "Prepare employee", "assignee": " Monika ",
+    }))
+    second = json.loads(kt._handle_create({
+        "title": "Prepare employee", "assignee": "monika",
+    }))
+
+    assert first["task_id"] == second["task_id"]
+
+
+def test_gateway_distinguishes_assignments_from_same_message(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+
+    first = json.loads(kt._handle_create({
+        "title": "Check account",
+        "body": "Check the first period",
+        "assignee": "hanno",
+        "assignment_id": "period-1",
+    }))
+    second = json.loads(kt._handle_create({
+        "title": "Check account",
+        "body": "Check the second period",
+        "assignee": "hanno",
+        "assignment_id": "period-2",
+    }))
+
+    assert first["task_id"] != second["task_id"]
+
+
+def test_gateway_retry_keeps_assignment_identity_when_content_changes(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_MESSAGE_ID", "message-7")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+
+    first = json.loads(kt._handle_create({
+        "title": "Initial title",
+        "body": "Initial wording",
+        "assignee": "hanno",
+        "assignment_id": "period-1",
+    }))
+    retry = json.loads(kt._handle_create({
+        "title": "Reworded title",
+        "body": "Reworded without changing the assignment",
+        "assignee": "hanno",
+        "assignment_id": "period-1",
+    }))
+
+    assert first["task_id"] == retry["task_id"]
+
+
+def test_gateway_contextvars_drive_identity_and_origin_route(monkeypatch, worker_env):
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    for key in (
+        "HERMES_SESSION_PLATFORM",
+        "HERMES_SESSION_CHAT_ID",
+        "HERMES_SESSION_THREAD_ID",
+        "HERMES_SESSION_MESSAGE_ID",
+        "HERMES_SESSION_PROFILE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+    set_session_vars(
+        profile="monika",
+        platform="telegram",
+        chat_id="chat-voice",
+        thread_id="topic-3",
+        message_id="wispr-message-9",
+        chat_type="dm",
+    )
+    try:
+        first = json.loads(
+            kt._handle_create(
+                {
+                    "title": "Voice assignment",
+                    "assignee": "neo",
+                    "assignment_id": "technical-step",
+                }
+            )
+        )
+        retry = json.loads(
+            kt._handle_create(
+                {
+                    "title": "Reworded voice assignment",
+                    "assignee": "neo",
+                    "assignment_id": "technical-step",
+                }
+            )
+        )
+    finally:
+        reset_session_vars()
+
+    assert first["task_id"] == retry["task_id"]
+    subscriptions = _list_subs_for_task(first["task_id"])
+    assert len(subscriptions) == 1
+    assert subscriptions[0]["platform"] == "telegram"
+    assert subscriptions[0]["chat_id"] == "chat-voice"
+    assert subscriptions[0]["thread_id"] == "topic-3"
+    assert subscriptions[0]["notifier_profile"] == "monika"
+    assert subscriptions[0]["delivery_metadata"]["telegram_reply_to_message_id"] == (
+        "wispr-message-9"
+    )
+
+
+def test_gateway_create_rejects_missing_event_identity(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.delenv("HERMES_SESSION_MESSAGE_ID", raising=False)
+
+    result = json.loads(kt._handle_create({
+        "title": "Prepare employee", "assignee": "monika",
+    }))
+
+    assert "error" in result
+    assert "event identity" in result["error"]
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 1
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
@@ -996,12 +1258,8 @@ def test_create_does_not_subscribe_in_cli_session(monkeypatch, worker_env):
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env, tmp_path):
-    """The config gate kanban.auto_subscribe_on_create=false must
-    suppress auto-subscription even when the session has a delivery
-    channel. This is the knob that addresses the upstream design
-    concern from PR #19718 (reverted in #19721) — users who want
-    explicit kanban_notify-subscribe calls per task get that."""
+def test_gateway_create_fails_closed_when_auto_subscribe_is_disabled(monkeypatch, worker_env, tmp_path):
+    """Gateway work cannot be created when its durable return route is disabled."""
     # worker_env already created <tmp>/.hermes; use a fresh sibling
     # home to avoid mkdir() colliding with the worker's directory.
     home = tmp_path / "gate-home" / ".hermes"
@@ -1015,21 +1273,20 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
 
     from tools import kanban_tools as kt
     out = kt._handle_create({
-        "title": "no sub gated",
+        "title": "no detached gateway work",
         "assignee": "peer",
     })
     d = json.loads(out)
-    assert d["ok"] is True
-    assert d["subscribed"] is False, d
+    assert "error" in d, d
 
-    assert _list_subs_for_task(d["task_id"]) == []
+    from hermes_cli import kanban_db as kb
+    with kb.connect() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
-def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
-    """If add_notify_sub itself raises (e.g. DB locked, schema drift),
-    _maybe_auto_subscribe must NOT bubble that up and fail the parent
-    kanban_create. The function returns False and the parent create
-    still succeeds with subscribed=False."""
+def test_gateway_create_rolls_back_when_origin_subscription_fails(monkeypatch, worker_env):
+    """Gateway work must not outlive a failure to persist its return route."""
+    from hermes_cli import kanban_db as kb
     from tools import kanban_tools as kt
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
@@ -1042,12 +1299,18 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     monkeypatch.setattr(kbn, "add_notify_sub", _boom)
 
     out = kt._handle_create({
-        "title": "auto-sub tolerates add_notify_sub failure",
+        "title": "origin route must be atomic",
         "assignee": "peer",
     })
     d = json.loads(out)
-    assert d["ok"] is True, d
-    assert d["subscribed"] is False, d
+    assert "error" in d, d
+
+    with kb.connect() as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = ?",
+            ("origin route must be atomic",),
+        ).fetchone()[0]
+    assert count == 0
 
 
 # ---------------------------------------------------------------------------

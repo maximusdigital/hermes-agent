@@ -1260,6 +1260,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    notify_sub: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1314,17 +1315,6 @@ def create_task(
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
-    # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
-    # race may insert twice, the next lookup stabilises on the newest.
-    if idempotency_key:
-        row = conn.execute(
-            "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
-            "ORDER BY created_at DESC LIMIT 1", (idempotency_key,),
-        ).fetchone()
-        if row:
-            return row["id"]
-
     now = int(time.time())
 
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
@@ -1341,6 +1331,19 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                # Serialize lookup and insert; the partial unique index is the
+                # final backstop for concurrent or direct-SQL creators.
+                if idempotency_key:
+                    row = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if row:
+                        if notify_sub:
+                            from hermes_cli import kanban_db_notify as _kbn
+                            _kbn.add_notify_sub(conn, task_id=row["id"], **notify_sub)
+                        return row["id"]
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
@@ -1415,8 +1418,22 @@ def create_task(
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
                 inherit_creator_origin(conn, task_id, creator_task_id, created_at=now)
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
+                if notify_sub:
+                    from hermes_cli import kanban_db_notify as _kbn
+                    _kbn.add_notify_sub(conn, task_id=task_id, **notify_sub)
             return task_id
         except sqlite3.IntegrityError:
+            if idempotency_key:
+                row = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if row:
+                    if notify_sub:
+                        from hermes_cli import kanban_db_notify as _kbn
+                        _kbn.add_notify_sub(conn, task_id=row["id"], **notify_sub)
+                    return row["id"]
             if attempt == 1:
                 raise
     raise RuntimeError("unreachable")
@@ -3231,6 +3248,8 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if cur_row["status"] == "todo" and kind != "dependency":
+            return False
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3253,7 +3272,11 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
-        source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
+        source_status = (
+            _retry_status_for_run(conn, task_id)
+            if cur_row["status"] == "running"
+            else cur_row["status"]
+        )
         requested_kind = kind
         rekind_reason = None
         # ``dependency`` only waits on incomplete parents. A worker filing that
@@ -3278,7 +3301,7 @@ def block_task(
                        worker_pid    = NULL,
                        {set_sql}
                  WHERE id = ?
-                   AND status IN ('running', 'ready')
+                   AND status IN ('running', 'ready', 'todo')
                 """
         params = (*params, task_id)
         if expected_run_id is not None:
