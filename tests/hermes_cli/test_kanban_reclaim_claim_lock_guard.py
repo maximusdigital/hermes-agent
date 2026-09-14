@@ -113,3 +113,39 @@ def test_genuine_crash_still_reclaims(conn):
     assert tid in crashed
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")
+
+
+def test_dead_worker_with_max_retries_one_blocks_without_respawn(conn):
+    """One failed run means zero retries when a task sets max_retries=1."""
+    host = kb._claimer_id().split(":", 1)[0]
+    tid = kb.create_task(
+        conn,
+        title="single-attempt restart",
+        assignee="w",
+        max_retries=1,
+    )
+    kb.claim_task(conn, tid, claimer=f"{host}:restart")
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    kb._set_worker_pid(conn, tid, dead.pid)
+    conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
+    conn.execute(
+        "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?", (tid,)
+    )
+    conn.commit()
+    kb._record_worker_exit(dead.pid, 1 << 8)
+
+    spawned = []
+    result = kb.dispatch_once(
+        conn,
+        spawn_fn=lambda *args: spawned.append(args),
+    )
+
+    task = kb.get_task(conn, tid)
+    assert task is not None
+    assert result.crashed == [tid]
+    assert result.auto_blocked == [tid]
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 1
+    assert spawned == []
+    assert kb.claim_task(conn, tid) is None
