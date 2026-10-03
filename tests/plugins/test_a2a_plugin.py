@@ -607,6 +607,25 @@ class TestReplyCapture:
         finally:
             adapter._pop_pending("task-fail")
 
+    def test_on_processing_complete_success_waits_for_final_send(self):
+        """Gateway dispatch completion must not beat the asynchronous final reply."""
+        from gateway.platforms.base import ProcessingOutcome
+
+        adapter = _bare_adapter()
+        fut = adapter._add_pending("task-late", "ctx-late")
+        event = SimpleNamespace(message_id="task-late")
+
+        async def run():
+            await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+            assert fut.done() is False
+            await adapter.send("ctx-late", "late reply", metadata={"notify": True})
+
+        try:
+            asyncio.run(run())
+            assert fut.result(timeout=0) == (protocol.STATE_COMPLETED, "late reply")
+        finally:
+            adapter._pop_pending("task-late")
+
     def test_on_processing_complete_does_not_clobber_reply(self):
         from gateway.platforms.event import ProcessingOutcome
 

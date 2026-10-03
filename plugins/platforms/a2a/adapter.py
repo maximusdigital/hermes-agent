@@ -842,19 +842,17 @@ class A2AAdapter(BasePlatformAdapter):
         return {"name": f"a2a:{chat_id}", "type": "dm"}
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
-        """Resolve the task future when processing ends without a reply send (failures,
-        cancellations, empty runs, or a reply the gateway already streamed to the user) so the
-        HTTP thread returns promptly."""
+        """Resolve terminal outcomes that cannot be completed by a later final send."""
         task_id = str(getattr(event, "message_id", "") or "")
-        if task_id:
-            # A streamed turn never calls send() with notify=True (the gateway suppresses the
-            # normal final send once streaming delivered the body), so the SUCCESS default must
-            # not resolve with "" — that strands every A2A streaming reply as an empty completed
-            # task (#116944). _streamed_final_response is the same stash _final_text_for_post_turn_hooks
-            # reads for /goal and /loop.
-            _streamed = getattr(event, "_streamed_final_response", "")
-            default = (protocol.STATE_COMPLETED, _streamed if isinstance(_streamed, str) else "")
-            self._resolve_task(task_id, *{
-                ProcessingOutcome.FAILURE: (protocol.STATE_FAILED, "[agent processing failed]"),
-                ProcessingOutcome.CANCELLED: (protocol.STATE_CANCELED, ""),
-            }.get(outcome, default))
+        if not task_id:
+            return
+        if outcome == ProcessingOutcome.FAILURE:
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+        elif outcome == ProcessingOutcome.CANCELLED:
+            self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+        else:
+            # Streaming suppresses the normal final send, while non-streaming success may
+            # dispatch its notify-marked reply after this hook returns.
+            streamed = getattr(event, "_streamed_final_response", "")
+            if isinstance(streamed, str) and streamed:
+                self._resolve_task(task_id, protocol.STATE_COMPLETED, streamed)
