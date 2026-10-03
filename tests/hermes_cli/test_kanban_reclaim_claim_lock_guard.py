@@ -127,13 +127,13 @@ def test_dead_worker_with_max_retries_one_blocks_without_respawn(conn):
     kb.claim_task(conn, tid, claimer=f"{host}:restart")
     dead = subprocess.Popen(["true"])
     dead.wait()
-    kb._set_worker_pid(conn, tid, dead.pid)
+    kbd._set_worker_pid(conn, tid, dead.pid)
     conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
     conn.execute(
         "UPDATE task_runs SET started_at = started_at - 9999 WHERE task_id=?", (tid,)
     )
     conn.commit()
-    kb._record_worker_exit(dead.pid, 1 << 8)
+    kbd._record_worker_exit(dead.pid, 1 << 8)
 
     spawned = []
     result = kb.dispatch_once(
