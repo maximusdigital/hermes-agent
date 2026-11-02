@@ -229,11 +229,49 @@ def _capture_spawn(monkeypatch):
         calls.append({"command": command, **kwargs})
         return json.dumps({"output": "Background process started", "session_id": "proc_test1234"})
 
+    def fake_spawn_local_argv(argv, **kwargs):
+        session = type("Session", (), {"id": "proc_test1234", "pid": 1234,
+                                        "watcher_platform": "", "completion_output_chars": 0,
+                                        "notify_on_complete": False})()
+        setup = kwargs.get("setup_before_reader")
+        if setup:
+            setup(session)
+        calls.append({"command": shlex.join(argv), "background": True,
+                      "notify_on_complete": True, "_native_argv": argv,
+                      "_session": session, **kwargs})
+        return session
+
     import tools.terminal_tool as terminal_tool_module
+    from tools.process_registry import process_registry
 
     monkeypatch.setattr(terminal_tool_module, "terminal_tool", fake_terminal_tool)
+    monkeypatch.setattr(process_registry, "spawn_local_argv", fake_spawn_local_argv)
     return calls
 
+
+def _patch_non_push_native(monkeypatch, session_id, factory=None):
+    """Exercise the native spawn seam while forcing finite-session polling."""
+    from types import SimpleNamespace
+    from tools.process_registry import process_registry
+    import tools.terminal_tool_background as background
+
+    def no_async_delivery(session, result_data, notify_on_complete, watch_patterns):
+        result_data["notify_on_complete"] = False
+        result_data["notify_unsupported"] = "poll"
+        return False, None
+
+    def spawn(argv, **kwargs):
+        session = factory(argv, kwargs) if factory else SimpleNamespace(
+            id=session_id, pid=1234, watcher_platform="", notify_on_complete=False,
+            completion_output_chars=0,
+        )
+        setup = kwargs.get("setup_before_reader")
+        if setup:
+            setup(session)
+        return session
+
+    monkeypatch.setattr(background, "_apply_async_support", no_async_delivery)
+    monkeypatch.setattr(process_registry, "spawn_local_argv", spawn)
 
 def _runner_parts(command):
     """(mode, dm_file, transport argv) of a runner command. The optional ``--author <json>`` pair is skipped."""
@@ -282,10 +320,10 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     call = calls[0]
     assert call["background"] is True
     assert call["notify_on_complete"] is True
-    assert call["_host_local"] is True
+    assert call["_native_argv"]
     # The completion notification IS the reply: sized like a message, not a build log's 2000-char tail.
-    assert call["_completion_output_chars"] > bot_mode_dm.MESSAGE_MAX_CHARS
-    assert Path(call["workdir"]) == Path(bot_mode_dm.__file__).resolve().parent.parent
+    assert call["_session"].completion_output_chars > bot_mode_dm.MESSAGE_MAX_CHARS
+    assert Path(call["cwd"]) == Path(bot_mode_dm.__file__).resolve().parent.parent
     command = call["command"]
     mode, dm_file, transport_argv = _runner_parts(command)
     assert mode == "query-file"
@@ -313,6 +351,112 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     assert '$(and this is not shell)' in content
 
 
+def test_native_local_delivery_bypasses_terminal_approval(tmp_path, monkeypatch):
+    """Native local delivery uses the validated roster path, not terminal approval."""
+    calls = _capture_spawn(monkeypatch)
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    (home / "config.yaml").write_text(
+        "approvals:\n  deny:\n    - '*/.hermes/profiles/*'\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(
+        "tools.terminal_tool.terminal_tool",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("terminal_tool used")),
+    )
+    from tools.approval import check_all_command_guards
+
+    blocked = check_all_command_guards(
+        f"cat {home / 'profiles' / 'researcher' / 'profile.yaml'}", "local"
+    )
+    assert blocked["approved"] is False
+    result = json.loads(bot_mode_dm.message_agent_tool(
+        target="researcher", message="native payload", agent=_FakeAgent(home)))
+    assert result["status"] == "queued"
+    assert calls[0]["_native_argv"][:2] == [sys.executable, str(Path(bot_mode_dm.__file__).resolve())]
+    assert calls[0]["_native_argv"][2] == "--run-delivery"
+
+
+def test_native_setup_failure_reaps_process_without_watcher_artifact(tmp_path, monkeypatch):
+    """A failed tracking phase must not arm a watcher for an untracked process."""
+    from tools.process_registry import process_registry
+    import tools.terminal_tool_background as background
+
+    process_registry.pending_watchers.clear()
+    captured = {}
+    real_popen = subprocess.Popen
+
+    def capture_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        captured["proc"] = proc
+        return proc
+
+    def async_support(session, result_data, notify_on_complete, watch_patterns):
+        session.watcher_platform = "telegram"
+        return True, None
+
+    monkeypatch.setattr("tools.process_registry.subprocess.Popen", capture_popen)
+    monkeypatch.setattr(process_registry, "_track_started", lambda *args: (_ for _ in ()).throw(RuntimeError("track failed")))
+    monkeypatch.setattr(background, "_apply_async_support", async_support)
+    monkeypatch.setattr(background, "_register_completion_watcher", lambda *args: pytest.fail("watcher armed before tracking"))
+
+    result = json.loads(bot_mode_dm._spawn_delivery(
+        [sys.executable, "-c", "print('SHOULD_BE_REAPED')"], "researcher",
+        task_id="task", agent=_FakeAgent(tmp_path / ".hermes"), env={},
+    ))
+
+    assert "error" in result
+    assert process_registry.pending_watchers == []
+    assert captured["proc"].poll() is not None
+
+
+def test_fast_exit_watcher_failure_keeps_single_notification_route(tmp_path, monkeypatch):
+    """A watcher failure cannot turn an already queued completion into polling."""
+    import queue
+    from tools.process_registry import process_registry
+    import tools.terminal_tool_background as background
+
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            break
+    process_registry.pending_watchers.clear()
+    captured = {}
+    checkpoint_intervals = []
+    real_write_checkpoint = process_registry._write_checkpoint
+
+    def record_checkpoint():
+        session = captured.get("session")
+        checkpoint_intervals.append(None if session is None else session.watcher_interval)
+        real_write_checkpoint()
+
+    def async_support(session, result_data, notify_on_complete, watch_patterns):
+        captured["session"] = session
+        session.watcher_platform = "telegram"
+        return True, None
+
+    def fail_after_exit(registry, session, session_key):
+        session.watcher_interval = 5
+        assert session._completion_event.wait(5), "fast runner did not finish"
+        raise RuntimeError("watcher raced with exit")
+
+    monkeypatch.setattr(process_registry, "_write_checkpoint", record_checkpoint)
+    monkeypatch.setattr(background, "_apply_async_support", async_support)
+    monkeypatch.setattr(background, "_register_completion_watcher", fail_after_exit)
+
+    result = json.loads(bot_mode_dm._spawn_delivery(
+        [sys.executable, "-c", "print('FAST_REPLY')"], "researcher",
+        task_id="task", agent=None, env={},
+    ))
+
+    session = captured["session"]
+    assert result["reply_delivery"] == "poll"
+    assert session.notify_on_complete is False
+    assert session.watcher_interval == 0
+    assert checkpoint_intervals[-1] == 0
+    assert session.id == result["process_id"]
+    assert process_registry.completion_queue.empty()
+    assert process_registry.pending_watchers == []
 
 
 def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypatch):
@@ -451,6 +595,25 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     assert transport_argv == ["hermes", "-p", "default", "peer", "dm", "spark"]
 
 
+def test_peer_delivery_does_not_construct_local_delivery_env(tmp_path, monkeypatch):
+    calls = _capture_spawn(monkeypatch)
+    monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
+    monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: pytest.fail("peer env must be built by runner"))
+    home = _managed_home(tmp_path, peers=("spark",))
+    result = json.loads(bot_mode_dm.message_agent_tool("spark", "ping", agent=_FakeAgent(home)))
+    assert result["status"] == "queued"
+    assert _runner_parts(calls[0]["command"])[0] == "stdin"
+
+
+def test_delivery_env_failure_cleans_up_payload(tmp_path, monkeypatch):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("env failed")))
+    monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
+    result = json.loads(bot_mode_dm.message_agent_tool("researcher", "secret", agent=_FakeAgent(home)))
+    assert "error" in result
+    assert not list(tmp_path.glob("dm-*.txt"))
+
+
 def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, monkeypatch):
     """A background delivery must not rely on PATH: the runner's service context
     lacks the gateway's venv bin dir, so a bare ``hermes`` resolves to a system
@@ -571,7 +734,7 @@ def test_live_dm_admitted_before_waiter_failure(tmp_path, monkeypatch):
     assert record["owner"] == owner
     assert record["message"] == "Message from 🤖 hermes (@hermes): hello"
     assert record["author"] == {"id": "bot:default", "name": "hermes", "is_bot": True}
-    assert "notification_error" in result
+    assert result.get("process_id")
 
 
 def test_live_dm_runner_retry_never_reexecutes_failed_claim(tmp_path, monkeypatch, capsys):
@@ -1032,11 +1195,7 @@ def test_ack_names_poll_return_path_when_session_cannot_receive_completions(tmp_
     """#101142: on a non-push sender surface (api_server) terminal_tool refuses the
     ``notify_on_complete`` promise, so the reply can never be injected later. The ack must not
     promise a completion notification; it names the surface-supported return path instead."""
-    import tools.terminal_tool as terminal_tool_module
-
-    monkeypatch.setattr(terminal_tool_module, "terminal_tool", lambda command, **kw: json.dumps({
-        "output": "Background process started", "session_id": "proc_np1", "notify_on_complete": False,
-        "notify_unsupported": "poll"}))
+    _patch_non_push_native(monkeypatch, "proc_np1")
     home = _managed_home(tmp_path, teammates=("researcher",))
     result = json.loads(bot_mode_dm.message_agent_tool(
         target="researcher", message="hi", agent=_FakeAgent(home, title="Bot Chat")))
@@ -1051,15 +1210,13 @@ def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive
     stdout carries the reply. On a non-push sender the live-owner ack must propagate
     ``reply_delivery="poll"`` and the wait instruction instead of 'finish your turn'."""
     from tools import bot_live_delivery as live
-    import tools.terminal_tool as terminal_tool_module
 
     home = _managed_home(tmp_path)
     target = home / "profiles" / "researcher"
     owner = dict(profile_home=str(target), session_id="bot", lease_id="lease", live_session_id="live")
     monkeypatch.setattr(live, "find_canonical_live_owner", lambda h: owner if Path(h) == target else None)
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
-    monkeypatch.setattr(terminal_tool_module, "terminal_tool", lambda command, **kw: json.dumps({
-        "output": "Background process started", "session_id": "proc_np2", "notify_on_complete": False}))
+    _patch_non_push_native(monkeypatch, "proc_np2")
 
     result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
@@ -1072,20 +1229,25 @@ def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_pat
     """#101142 durable leg: with no completion notification the sender may end its turn without
     polling; the tracked runner's exit must still land the reply in the sender's session transcript
     as a DELIVERY row (``display_kind=process_complete``), so nothing is silently lost."""
-    import tools.terminal_tool as terminal_tool_module
     from tools.process_registry import process_registry
 
     reply = json.dumps({"status": "settled", "reply": "PAYLOAD_SENTINEL_42", "delivery_id": "d1"})
     procs = []
 
-    def fake_terminal_tool(command, **kw):
-        popen = subprocess.Popen([sys.executable, "-c", f"import json; print({reply!r})"],
+    def native_factory(argv, kwargs):
+        popen = subprocess.Popen(
+            [sys.executable, "-c", f"import json; print({reply!r})"],
+            cwd=kwargs["cwd"], env=kwargs["env_vars"],
                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        procs.append(process_registry.adopt_local(popen, command=command, cwd=str(tmp_path), notify_on_complete=False))
-        return json.dumps({"output": "Background process started", "session_id": procs[-1].id,
-                           "notify_on_complete": False})
+        session = process_registry.adopt_local(
+            popen, command=shlex.join(argv), cwd=kwargs["cwd"], task_id=kwargs["task_id"],
+            owner_task_id=kwargs["owner_task_id"], session_key=kwargs["session_key"],
+            notify_on_complete=False,
+        )
+        procs.append(session)
+        return session
 
-    monkeypatch.setattr(terminal_tool_module, "terminal_tool", fake_terminal_tool)
+    _patch_non_push_native(monkeypatch, "unused", factory=native_factory)
     home = _managed_home(tmp_path, teammates=("researcher",))
     agent = _FakeAgent(home, title="Bot Chat")
     rows = []

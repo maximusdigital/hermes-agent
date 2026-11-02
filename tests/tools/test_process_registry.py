@@ -1122,7 +1122,7 @@ class TestEnvPollerIncrementalRead:
 class TestPopenLeakOnSetupFailure:
     """Regression for issue #2749: subprocess orphaned when post-Popen setup raises."""
 
-    def test_popen_killed_when_thread_creation_fails(self, registry):
+    def test_popen_killed_when_thread_creation_fails(self, registry, tmp_path):
         """If Thread() raises after Popen, proc must be killed — not orphaned."""
         killed = []
 
@@ -1155,9 +1155,81 @@ class TestPopenLeakOnSetupFailure:
              patch("os.getpgid", side_effect=ProcessLookupError), \
              patch.object(registry, "_write_checkpoint"):
             with pytest.raises(RuntimeError, match="Thread creation failed"):
-                registry.spawn_local("echo hello", cwd="/tmp")
+                registry.spawn_local("echo hello", cwd=str(tmp_path))
 
         assert killed, "proc.kill() must be called when post-Popen setup raises"
+
+    def test_systemd_setup_failure_terminates_parent_before_scope(self, registry):
+        proc = MagicMock(pid=4320)
+        session = _make_session(sid="proc_scope", command="worker")
+        session.systemd_unit = "hermes-worker-proc_scope.scope"
+        order = []
+        with patch.object(registry, "_terminate_host_pid", side_effect=lambda *args: order.append("parent")), \
+             patch("tools.process_registry._stop_systemd_unit", side_effect=lambda unit: order.append("scope")), \
+             patch.object(proc, "wait"):
+            registry._reap_untracked(session, proc)
+        assert order == ["parent", "scope"]
+
+    def test_argv_setup_failure_reaps_after_popen(self, registry):
+        proc = MagicMock(pid=4321)
+        proc.poll.return_value = None
+        with patch("subprocess.Popen", return_value=proc), \
+             patch.object(registry, "_reap_untracked") as reap:
+            with pytest.raises(RuntimeError, match="setup failed"):
+                registry.spawn_local_argv(
+                    [sys.executable, "-c", "pass"],
+                    setup_before_reader=lambda session: (_ for _ in ()).throw(RuntimeError("setup failed")),
+                )
+        reap.assert_called_once()
+
+    def test_argv_preserves_shell_false_env_and_cwd(self, registry, tmp_path):
+        proc = MagicMock(pid=4322)
+        captured = {}
+        with patch("subprocess.Popen", side_effect=lambda *a, **kw: (captured.update(args=a, kwargs=kw) or proc)), \
+             patch.object(registry, "_track_started"), \
+             patch.object(registry, "_safe_host_start_time", return_value=None):
+            registry.spawn_local_argv([sys.executable, "-c", "pass"], cwd=str(tmp_path), env_vars={"DM_TEST": "1"})
+        assert captured["args"][0] == [sys.executable, "-c", "pass"]
+        assert captured["kwargs"]["shell"] is False
+        assert captured["kwargs"]["cwd"] == str(tmp_path)
+        assert captured["kwargs"]["env"]["DM_TEST"] == "1"
+
+    @pytest.mark.linux_only
+    def test_argv_uses_supervised_scope_without_shell(self, registry):
+        proc = MagicMock(pid=4323)
+        captured = {}
+        with patch("tools.process_registry._is_supervised_gateway_process", return_value=True), \
+             patch("tools.process_registry._systemd_run_user_scope_available", return_value=True), \
+             patch("subprocess.Popen", side_effect=lambda *a, **kw: (captured.update(args=a, kwargs=kw) or proc)), \
+             patch.object(registry, "_track_started"), \
+             patch.object(registry, "_safe_host_start_time", return_value=None):
+            session = registry.spawn_local_argv([sys.executable, "-c", "pass"])
+        assert os.path.basename(captured["args"][0][0]) == "systemd-run"
+        assert captured["kwargs"]["shell"] is False
+        assert session.systemd_unit.endswith(".scope")
+
+    def test_argv_fast_exit_preserves_setup_metadata_and_completion(self, registry, tmp_path):
+        def setup(session):
+            session.notify_on_complete = True
+            session.completion_output_chars = 321
+            session.watcher_platform = "telegram"
+            session.watcher_chat_id = "chat-1"
+
+        session = registry.spawn_local_argv(
+            [sys.executable, "-c", "print('RACE_PAYLOAD')"],
+            cwd=str(tmp_path), notify_on_complete=True, setup_before_reader=setup,
+        )
+
+        assert session._completion_event.wait(5)
+        assert session.output_buffer.strip() == "RACE_PAYLOAD"
+        assert session.completion_output_chars == 321
+        assert session.watcher_platform == "telegram"
+        assert session.watcher_chat_id == "chat-1"
+        assert registry.get(session.id) is session
+        assert session.id not in registry._running
+        event = registry.completion_queue.get(timeout=1)
+        assert event["type"] == "completion"
+        assert event["session_id"] == session.id
 
 # =========================================================================
 # Spawn rewrite regression (issue #68915)
@@ -1233,6 +1305,74 @@ class TestSpawnRewriteCompoundBackground:
 # =========================================================================
 
 class TestCheckpoint:
+    def test_checkpoint_writers_cannot_overwrite_newer_snapshot(self, registry, tmp_path, monkeypatch):
+        """Snapshot and replacement are serialized, not only each atomic rename."""
+        import tools.process_registry as pr
+        import utils
+
+        session = _make_session(sid="proc_checkpoint_order", command="worker")
+        session.pid = os.getpid()
+        session.notify_on_complete = True
+        session.watcher_interval = 5
+        registry._running[session.id] = session
+        first_started = threading.Event()
+        release_first = threading.Event()
+        writes = []
+
+        def controlled_write(path, entries):
+            snapshot = json.loads(json.dumps(entries))
+            if not first_started.is_set():
+                first_started.set()
+                assert release_first.wait(5)
+            writes.append(snapshot)
+
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "procs.json")
+        monkeypatch.setattr(utils, "atomic_json_write", controlled_write)
+        older = threading.Thread(target=registry._write_checkpoint)
+        older.start()
+        assert first_started.wait(5)
+        with registry._lock:
+            session.notify_on_complete = False
+            session.watcher_interval = 0
+        newer = threading.Thread(target=registry._write_checkpoint)
+        newer.start()
+        time.sleep(0.05)
+        assert newer.is_alive(), "newer checkpoint bypassed writer serialization"
+        release_first.set()
+        older.join(5)
+        newer.join(5)
+
+        final = writes[-1][0]
+        assert final["notify_on_complete"] is False
+        assert final["watcher_interval"] == 0
+
+    def test_poll_fallback_checkpoint_does_not_recover_watcher(self, registry, tmp_path, monkeypatch):
+        """A failed watcher stays disarmed after later checkpoint writes and recovery."""
+        import tools.process_registry as pr
+
+        checkpoint = tmp_path / "procs.json"
+        session = _make_session(sid="proc_poll_only", command="worker")
+        session.pid = os.getpid()
+        session.pid_scope = "host"
+        session.host_start_time = registry._safe_host_start_time(session.pid)
+        session.notify_on_complete = True
+        session.watcher_interval = 5
+        session.watcher_platform = "telegram"
+        registry._running[session.id] = session
+
+        monkeypatch.setattr(pr, "CHECKPOINT_PATH", checkpoint)
+        assert registry.disable_completion_notification(session.id) is True
+        registry._write_checkpoint()  # unrelated later write must preserve disarm
+
+        recovered = ProcessRegistry()
+        monkeypatch.setattr(recovered, "_host_pid_is_ours", lambda *_args: True)
+        assert recovered.recover_from_checkpoint() == 1
+        restored = recovered.get(session.id)
+        assert restored is not None
+        assert restored.notify_on_complete is False
+        assert restored.watcher_interval == 0
+        assert recovered.pending_watchers == []
+
     def test_recover_dead_pid(self, registry, tmp_path):
         checkpoint = tmp_path / "procs.json"
         checkpoint.write_text(json.dumps([{

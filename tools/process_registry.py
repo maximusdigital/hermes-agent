@@ -28,7 +28,7 @@ _IS_LINUX = platform.system() == "Linux"
 from tools.environments.local import _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, NamedTuple, Optional
+from typing import Any, Callable, Dict, List, Literal, NamedTuple, Optional
 
 from hermes_cli.config import get_hermes_home
 
@@ -610,6 +610,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self._running: Dict[str, ProcessSession] = {}
         self._finished: Dict[str, ProcessSession] = {}
         self._lock = threading.Lock()
+        # Serialize checkpoint snapshot + replacement so an older writer can never
+        # overwrite newer routing/notification state after releasing `_lock`.
+        self._checkpoint_lock = threading.Lock()
         # Side-channel for check_interval watchers (gateway reads after agent run)
         self.pending_watchers: List[Dict[str, Any]] = []
         # Unified queue for all background events (distinguished by "type"); the CLI
@@ -1243,26 +1246,76 @@ class ProcessRegistry(ProcessCheckpointMixin):
             raise
         return session
 
+    def spawn_local_argv(
+        self, argv: List[str], cwd: str = None, task_id: str = "", session_key: str = "",
+        env_vars: dict = None, owner_task_id: str = "", notify_on_complete: bool = False,
+        setup_before_reader: Optional[Callable[[ProcessSession], None]] = None,
+    ) -> ProcessSession:
+        """Spawn a trusted argv child without a shell.
+
+        ``setup_before_reader`` is deliberately narrow: notification callers use it to
+        finish session configuration before an exited child can publish completion.
+        """
+        if not argv or not all(isinstance(part, str) for part in argv):
+            raise ValueError("argv must be a non-empty list of strings")
+        session = self._new_session(
+            " ".join(shlex.quote(part) for part in argv), task_id, owner_task_id, session_key,
+            _resolve_safe_cwd(cwd or os.getcwd()),
+        )
+        spawn_argv = list(argv)
+        spawn_env = self._spawn_env(env_vars)
+        if _IS_LINUX and _is_supervised_gateway_process() and _systemd_run_user_scope_available():
+            scoped_argv = _build_systemd_scope_argv(spawn_argv, unit_suffix=session.id)
+            if scoped_argv != spawn_argv:
+                session.systemd_unit = f"hermes-worker-{session.id}.scope"
+                spawn_argv = scoped_argv
+                spawn_env = systemd_user_bus_env(spawn_env)
+            else:
+                logger.debug("systemd-run disappeared after the availability probe; using direct argv fallback")
+        elif _IS_LINUX and _is_supervised_gateway_process():
+            logger.debug("argv background executor not isolated in a systemd scope; worker shares the gateway cgroup")
+        proc: Optional[subprocess.Popen] = None
+        try:
+            proc = subprocess.Popen(
+                spawn_argv, shell=False, text=True, cwd=session.cwd, env=spawn_env,
+                encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True,
+                **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}),
+            )
+            session.process = proc
+            session.pid = proc.pid
+            session.host_start_time = self._safe_host_start_time(session.pid)
+            session.notify_on_complete = notify_on_complete
+            if setup_before_reader is not None:
+                setup_before_reader(session)
+            self._track_started(session, self._reader_loop, f"proc-argv-reader-{session.id}")
+        except Exception:
+            if proc is not None:
+                self._reap_untracked(session, proc)
+            raise
+        return session
+
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
         """Post-Popen setup failed: kill the orphaned subprocess (and any setsid
         descendants) so nothing leaks untracked."""
-        with suppress(Exception):
-            if session.systemd_unit:
-                # Scope teardown is the authoritative cleanup for the worker cgroup
-                # (never killpg here); the wrapper PID is terminated as fallback.
-                _stop_systemd_unit(session.systemd_unit)
-                # The worker runs in its own systemd scope and, since the #70716 session-isolation fix, its
-                # own session. Stop the scope (kills every process in the worker cgroup), then terminate the
-                # systemd-run wrapper PID as fallback.
+        if session.systemd_unit:
+            # Keep scope teardown second even if parent termination is best effort.
+            with suppress(Exception):
+                # Let the recorded parent reap its children before the scope kills
+                # any survivors.
                 self._terminate_host_pid(proc.pid, session.host_start_time)
-            elif not _IS_WINDOWS:
-                try:
-                    kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
-                    os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
-                except (ProcessLookupError, PermissionError, OSError):
+            with suppress(Exception):
+                _stop_systemd_unit(session.systemd_unit)
+        else:
+            with suppress(Exception):
+                if not _IS_WINDOWS:
+                    try:
+                        kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                        os.killpg(os.getpgid(proc.pid), kill_signal)  # windows-footgun: ok - guarded by _IS_WINDOWS above
+                    except (ProcessLookupError, PermissionError, OSError):
+                        proc.kill()
+                else:
                     proc.kill()
-            else:
-                proc.kill()
         with suppress(Exception):
             proc.wait(timeout=5)
 
@@ -1592,6 +1645,26 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 save_completed_result(session)
                 self._running.pop(session.id)
             self._finished[session.id] = session
+            if was_running and session.notify_on_complete:
+                notification = {
+                    "type": "completion",
+                    "session_id": session.id,
+                    "session_key": session.session_key,
+                    "task_id": session.task_id,
+                    "owner_task_id": session.owner_task_id or session.task_id,
+                    "command": session.command,
+                    **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+                    **self._exit_fields(session),
+                    # A consumer that relays the output (a bot DM's reply) must know it is not whole.
+                    **_completion_output(session),
+                    # Stable producer identity across checkpoint recovery (unlike a
+                    # consumer-observed completion timestamp).
+                    "started_at": session.started_at,
+                }
+                _redact_process_result(notification)
+                # Enqueue under the registry lock so disable_completion_notification()
+                # can atomically choose notification or polling after a watcher failure.
+                self.completion_queue.put(notification)
         # Release the retained Popen/PTY handles now: otherwise every
         # finished-but-unpruned session keeps its stdout pipe (or PTY master)
         # FD open until FINISHED_TTL_SECONDS elapses, and heavy background
@@ -1603,24 +1676,6 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # buffered ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
         self._write_checkpoint()
-        if was_running and session.notify_on_complete:
-            notification = {
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "task_id": session.task_id,
-                "owner_task_id": session.owner_task_id or session.task_id,
-                "command": session.command,
-                **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
-                **self._exit_fields(session),
-                # A consumer that relays the output (a bot DM's reply) must know it is not whole.
-                **_completion_output(session),
-                # Stable producer identity across checkpoint recovery (unlike a
-                # consumer-observed completion timestamp).
-                "started_at": session.started_at,
-            }
-            _redact_process_result(notification)
-            self.completion_queue.put(notification)
         session._completion_event.set()
         return was_running
 
@@ -1655,6 +1710,42 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 session._pty.close()
 
     # ----- Query Methods -----
+
+    def disable_completion_notification(self, session_id: str) -> bool:
+        """Atomically switch one tracked process from notification to polling.
+
+        A gateway watcher can fail after a fast process already queued its completion.
+        Holding the registry lock matches `_move_to_finished`; the queue mutex then
+        retracts only that process's completion without racing unrelated producers.
+        """
+        if not session_id:
+            return False
+        with self._lock:
+            session = self._running.get(session_id) or self._finished.get(session_id)
+            if session is None:
+                return False
+            session.notify_on_complete = False
+            session.watcher_interval = 0
+            pending = self.completion_queue
+            with pending.mutex:
+                kept = [
+                    item for item in pending.queue
+                    if not (
+                        isinstance(item, dict)
+                        and item.get("type") == "completion"
+                        and item.get("session_id") == session_id
+                    )
+                ]
+                removed = len(pending.queue) - len(kept)
+                if removed:
+                    pending.queue.clear()
+                    pending.queue.extend(kept)
+                    pending.unfinished_tasks = max(0, pending.unfinished_tasks - removed)
+                    pending.not_full.notify_all()
+        # Persist the disarmed watcher state without holding the registry lock;
+        # checkpoint serialization acquires its own file/process coordination.
+        self._write_checkpoint()
+        return True
 
     def is_completion_consumed(self, session_id: str) -> bool:
         """Check if a completion notification was already consumed via wait/log."""

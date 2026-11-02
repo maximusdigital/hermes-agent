@@ -18,28 +18,31 @@ class ProcessCheckpointMixin:
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
 
         try:
-            with self._lock:
-                entries = []
-                for s in self._running.values():
-                    if s.exited:
-                        continue
-                    # Backfill the start time so recovery can detect PID recycling
-                    # even for sessions spawned before this field existed.
-                    if s.host_start_time is None and s.pid_scope == "host" and s.pid:
-                        s.host_start_time = self._safe_host_start_time(s.pid)
-                    entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
-                    # Redact inline credentials before persisting (~/.hermes/processes.json).
-                    # Recovery uses command only for display (adoption re-validates the
-                    # PID, never re-runs it), so masking is lossless.
-                    # See #77484.
-                    entry["command"] = redact_sensitive_text(s.command, code_file=True)
-                    entry["owner_task_id"] = s.owner_task_id or s.task_id
-                    entries.append(entry)
-                if extra_entries:
-                    tracked_ids = {item.get("session_id") for item in entries}
-                    entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
-            from utils import atomic_json_write
-            atomic_json_write(_checkpoint_path(), entries)
+            # Cover both snapshot and atomic replacement. Atomic rename prevents
+            # partial files but not an older snapshot overwriting a newer one.
+            with self._checkpoint_lock:
+                with self._lock:
+                    entries = []
+                    for s in self._running.values():
+                        if s.exited:
+                            continue
+                        # Backfill the start time so recovery can detect PID recycling
+                        # even for sessions spawned before this field existed.
+                        if s.host_start_time is None and s.pid_scope == "host" and s.pid:
+                            s.host_start_time = self._safe_host_start_time(s.pid)
+                        entry = {"session_id": s.id, **{f: getattr(s, f) for f in _CHECKPOINT_FIELDS}}
+                        # Redact inline credentials before persisting (~/.hermes/processes.json).
+                        # Recovery uses command only for display (adoption re-validates the
+                        # PID, never re-runs it), so masking is lossless.
+                        # See #77484.
+                        entry["command"] = redact_sensitive_text(s.command, code_file=True)
+                        entry["owner_task_id"] = s.owner_task_id or s.task_id
+                        entries.append(entry)
+                    if extra_entries:
+                        tracked_ids = {item.get("session_id") for item in entries}
+                        entries.extend(item for item in extra_entries if item.get("session_id") not in tracked_ids)
+                from utils import atomic_json_write
+                atomic_json_write(_checkpoint_path(), entries)
         except Exception as e:
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 

@@ -573,10 +573,9 @@ def _run_delivery(argv: list[str], dm_file: str, *, stdin_file: bool,
         _unlink_dm_file(dm_file)
 
 
-def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
-                      profile_home: Path | None = None, author: Optional[dict] = None) -> str:
-    """Build an argv-safe command for the cleanup-owning background runner:
-    ``--run-delivery [--author <json>] <mode> <dm_file> [--profile-home <path>] <argv...>``."""
+def _delivery_argv(argv: list[str], dm_file: str, *, stdin_file: bool,
+                   profile_home: Path | None = None, author: Optional[dict] = None) -> list[str]:
+    """Build the cleanup-owning runner argv without shell parsing."""
     runner_argv = [sys.executable, str(Path(__file__).resolve()), "--run-delivery",
                    "stdin" if stdin_file else "query-file", dm_file]
     if profile_home is not None:
@@ -589,7 +588,14 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
     if author:
         # Inserted after the slash rewrite: JSON escapes are backslashes too.
         runner_argv[3:3] = ["--author", json.dumps(author, separators=(",", ":"))]
-    return shlex.join(runner_argv)
+    return runner_argv
+
+
+def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool,
+                      profile_home: Path | None = None, author: Optional[dict] = None) -> str:
+    """Compatibility rendering for peer/relay transports that still use terminal_tool."""
+    return shlex.join(_delivery_argv(argv, dm_file, stdin_file=stdin_file,
+                                     profile_home=profile_home, author=author))
 
 
 def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bool,
@@ -605,8 +611,9 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                 "error": f"Live delivery admission could not be confirmed: {exc}. Do not resend.",
                 "evidence_file": dm_file})
         if record is not None:
-            command = _delivery_command(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
-            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent))
+            command = _delivery_argv(argv, dm_file, stdin_file=False, profile_home=profile_home, author=author)
+            notification = json.loads(_spawn_delivery(command, label, task_id=task_id, agent=agent,
+                                                      stdin_file=False, author=author))
             result = dict(status=record["status"], delivery_id=record["delivery_id"], to=label,
                           detail="Durably queued for the live Bot Chat owner. Do NOT wait or resend; finish your turn.")
             if notification.get("error"):
@@ -620,15 +627,17 @@ def _start_delivery(argv: list[str], content: str, label: str, *, stdin_file: bo
                     result["detail"] = f"Durably queued for the live Bot Chat owner. Do NOT resend. {notification['detail']}"
             return json.dumps(result)
     try:
-        command = _delivery_command(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
+        command = _delivery_argv(argv, dm_file, stdin_file=stdin_file, profile_home=profile_home, author=author)
     except BaseException:
         _unlink_dm_file(dm_file)
         raise
-    return _spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent)
+    return _spawn_delivery(command, label, dm_file=dm_file, task_id=task_id, agent=agent,
+                           stdin_file=stdin_file, author=author)
 
 
-def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, delivery_id: Optional[str] = None,
-                    task_id: Optional[str], agent: Any) -> str:
+def _spawn_delivery(command: str | list[str], label: str, *, dm_file: Optional[str] = None, delivery_id: Optional[str] = None,
+                    task_id: Optional[str], agent: Any, stdin_file: bool = False,
+                    author: Optional[dict] = None, env: Optional[dict[str, str]] = None) -> str:
     """Launch the cleanup-owning runner and transfer file ownership on ack. ``dm_file``
     is None for relay deliveries (the waiter watches a reply file; envelope artifacts
     are owned/swept by ``tools/bot_relay.py``), which pass the envelope id as ``delivery_id``
@@ -636,11 +645,51 @@ def _spawn_delivery(command: str, label: str, *, dm_file: Optional[str] = None, 
     to a background process, never a delivery receipt."""
     transferred = False
     try:
-        from tools.terminal_tool import terminal_tool
+        if isinstance(command, list) and not stdin_file:
+            from gateway.session_context import get_session_env
+            from tools.bot_relay import delivery_env
+            from tools.process_registry import process_registry
+            spawn_env = env if env is not None else delivery_env(author)
 
-        raw = terminal_tool(command, background=True, notify_on_complete=True, task_id=task_id,
-                            workdir=str(Path(__file__).resolve().parent.parent), _host_local=True,
-                            _completion_output_chars=REPLY_COMPLETION_CHARS)
+            session_key = get_session_env("HERMES_SESSION_KEY", "")
+            result_data = {"output": "Background process started", "session_id": "",
+                           "pid": None, "exit_code": 0, "error": None}
+
+            def configure_notifications(session):
+                from tools.terminal_tool_background import (
+                    _apply_async_support,
+                )
+                result_data["session_id"] = session.id
+                result_data["pid"] = session.pid
+                notify, _ = _apply_async_support(session, result_data, True, None)
+                session.notify_on_complete = bool(notify)
+                session.completion_output_chars = REPLY_COMPLETION_CHARS
+
+            session = process_registry.spawn_local_argv(
+                command, cwd=str(Path(__file__).resolve().parent.parent), task_id=task_id or "",
+                session_key=session_key, env_vars=spawn_env,
+                owner_task_id=task_id or "", notify_on_complete=True,
+                setup_before_reader=configure_notifications,
+            )
+            if session.notify_on_complete and session.watcher_platform:
+                from tools.terminal_tool_background import _register_completion_watcher
+                try:
+                    _register_completion_watcher(process_registry, session, session_key)
+                except Exception as exc:
+                    # Gateway completion events are watcher-owned. Atomically disable
+                    # and retract this process's queued completion before promising the
+                    # polling fallback, so a fast exit cannot create two return paths.
+                    logger.error("message_agent completion watcher setup failed: %s", exc, exc_info=True)
+                    process_registry.disable_completion_notification(session.id)
+                    result_data["notify_on_complete"] = False
+                    result_data["notify_unsupported"] = "watcher_setup_failed"
+            raw = json.dumps(result_data)
+        else:
+            from tools.terminal_tool import terminal_tool
+            raw = terminal_tool(command if isinstance(command, str) else shlex.join(command),
+                                background=True, notify_on_complete=True, task_id=task_id,
+                                workdir=str(Path(__file__).resolve().parent.parent),
+                                _completion_output_chars=REPLY_COMPLETION_CHARS)
         try:
             parsed = json.loads(raw)
         except (ValueError, TypeError):
