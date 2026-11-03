@@ -2159,6 +2159,13 @@ class GatewayShutdownMixin:
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        for _ts_task in list((getattr(self, "_thread_sync_tasks", None) or {}).values()):
+            _ts_task.cancel()
+        try:  # gateway shutdown: nothing this process minted stays valid
+            from tools.bot_thread_authority import deactivate_all
+            deactivate_all()
+        except Exception:
+            logger.debug("runner authority revocation failed", exc_info=True)
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)

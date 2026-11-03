@@ -1743,6 +1743,28 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
     replace."""
     existing = pending_messages.get(session_key)
     if existing:
+        def _merge_completion_hooks() -> None:
+            """Every admitted event must receive a terminal outcome after coalescing."""
+            first = getattr(existing, "on_complete", None)
+            second = getattr(event, "on_complete", None)
+            if not callable(second) or second is first:
+                return
+            if not callable(first):
+                setattr(existing, "on_complete", second)
+                return
+
+            async def _complete_all(outcome: str) -> None:
+                for hook in (first, second):
+                    try:
+                        result = hook(outcome)
+                        if inspect.isawaitable(result):
+                            await result
+                    except BaseException:
+                        logger.warning("coalesced on_complete hook failed (outcome=%s)", outcome,
+                                       exc_info=True)
+
+            setattr(existing, "on_complete", _complete_all)
+
         existing_type = getattr(existing, "message_type", None)
         existing_is_photo = existing_type == MessageType.PHOTO
         incoming_is_photo = event.message_type == MessageType.PHOTO
@@ -1759,6 +1781,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
         # A photo burst always absorbs; otherwise merge only when media is involved on either
         # side. Captions merge in every absorbing case.
         if both_photo or existing.media_urls or incoming_has_media:
+            _merge_completion_hooks()
             if both_photo or incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -1777,6 +1800,7 @@ def merge_pending_message_event(pending_messages: Dict[str, MessageEvent], sessi
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
+            _merge_completion_hooks()
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             return
@@ -1897,11 +1921,15 @@ class BasePlatformAdapter(ABC):
     # Back-reference to the running ``GatewayRunner`` (set by gateway/run.py); ``build_source``
     # resolves the inbound profile via ``runner._profile_name_for_source``.
     gateway_runner = None  # type: ignore[assignment]
+    # Grant broker of THIS started adapter (None until `_mark_connected`; dropped on disconnect/fatal).
+    _thread_broker = None
 
     def __init__(self, config: PlatformConfig, platform: Platform):
         self.config = config
         self.platform = platform
         self._message_handler: Optional[MessageHandler] = None
+        # Generic runner-owned seam for authenticated, profile-scoped extensions.
+        self._gateway_context_factory = None
         self._no_message_handler_logged: bool = False
         self._reaction_handler: Optional[Callable[[Dict[str, Any]], Awaitable[None]]] = None
         # Runner-owned boundary for normalized events: auth/profile state never lives in an adapter.
@@ -2111,6 +2139,7 @@ class BasePlatformAdapter(ABC):
         self._running = True
         self._fatal_error_code = self._fatal_error_message = None
         self._fatal_error_retryable = True
+        self._activate_thread_authority()
         if self.send_path_degraded:
             self._mark_degraded()
         else:
@@ -2129,12 +2158,14 @@ class BasePlatformAdapter(ABC):
 
     def _mark_disconnected(self) -> None:
         self._running = False
+        self._deactivate_thread_authority()
         if not self.has_fatal_error:
             self._write_runtime_status_safe(
                 "disconnected", platform_state="disconnected", error_code=None, error_message=None)
 
     def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
         self._running = False
+        self._deactivate_thread_authority()
         self._fatal_error_code, self._fatal_error_message = code, message
         self._fatal_error_retryable = retryable
         self._write_runtime_status_safe("fatal", platform_state="fatal", error_code=code, error_message=message)
@@ -2290,6 +2321,67 @@ class BasePlatformAdapter(ABC):
     def set_message_handler(self, handler: MessageHandler) -> None:
         """Set the incoming-message handler (MessageEvent -> optional response str)."""
         self._message_handler = handler
+
+    def _activate_thread_authority(self) -> None:
+        """Authenticated startup of a gateway-owned Telegram adapter creates its ThreadSync grant broker,
+        bound to this adapter, the PID, the running loop and the concrete owner/egress/audit callbacks."""
+        self._deactivate_thread_authority()
+        if getattr(getattr(self, "platform", None), "value", None) != "telegram" or self.gateway_runner is None:
+            return
+        try:
+            import asyncio
+            from tools import bot_thread_authority
+            from tools.bot_thread_provider import default_callbacks
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            self._thread_broker = bot_thread_authority._activate(self, loop, default_callbacks())
+        except Exception:
+            self._thread_broker = None
+            logger.debug("thread authority unavailable for %s", self.platform, exc_info=True)
+
+    def _deactivate_thread_authority(self) -> None:
+        """Disconnect/fatal/shutdown: unregister the broker and invalidate every grant it issued."""
+        if self._thread_broker is not None:
+            from tools import bot_thread_authority
+            bot_thread_authority.deactivate_adapter(self)
+            self._thread_broker = None
+
+    def _issue_thread_grant(self, runner: Any, ctx: Any) -> Optional[tuple]:
+        """Runner-only (not exported): after authenticated ingress/session resolution the runner asks THIS
+        started adapter for a grant. Returns ``(grant, broker)`` or None when this adapter is not the
+        active, runner-owned adapter of the context's profile."""
+        broker = self._thread_broker
+        if broker is None or runner is None or runner is not self.gateway_runner or not broker.adapter_is(self):
+            return None
+        owned = list((getattr(runner, "adapters", None) or {}).values())
+        for mapping in (getattr(runner, "_profile_adapters", None) or {}).values():
+            owned.extend((mapping or {}).values())
+        if not any(a is self for a in owned):
+            return None
+        expected = getattr(self, "_hermes_profile_name", None) or getattr(runner, "_primary_profile_name", None)
+        if expected and getattr(ctx, "profile", None) != expected:
+            return None  # an adapter only authorizes its OWN profile's threads
+        try:
+            return broker._issue(ctx), broker
+        except (PermissionError, ValueError):
+            return None
+
+    def set_gateway_context_factory(self, factory: Callable[[], Any]) -> None:
+        """Install the runner's authenticated-context factory for this adapter."""
+        self._gateway_context_factory = factory
+
+    def gateway_context(self) -> Any:
+        """Resolve authenticated gateway context at use time, failing closed."""
+        factory = self._gateway_context_factory
+        if not callable(factory):
+            return None
+        try:
+            return factory()
+        except Exception:
+            logger.debug("gateway extension context construction failed", exc_info=True)
+            return None
 
     def set_platform_event_handler(
         self, handler: Optional[Callable[[Dict[str, Any], Any], Awaitable[None]]]) -> None:
@@ -3763,7 +3855,7 @@ class BasePlatformAdapter(ABC):
                        state.first_ts + self._busy_text_hard_cap_seconds)
         return max(0.0, deadline - time.monotonic())
 
-    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> None:
+    async def _queue_text_debounce(self, session_key: str, event: MessageEvent) -> bool:
         """Buffer normal queue-mode busy text and schedule a bounded flush."""
         store = self._text_debounce_store()
         state = store.get(session_key)
@@ -3776,14 +3868,17 @@ class BasePlatformAdapter(ABC):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
                     merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
-                return
+                    return True
+                return False
         now = time.monotonic()
         if state is None:
             state = TextDebounceState(event=event, task=None, first_ts=now, last_ts=now)
             store[session_key] = state
         else:
-            if event.text:
-                state.event.text = _append_text(state.event.text, event.text)
+            # Reuse the canonical merge path so every admitted event keeps its
+            # completion callback as well as its text.
+            holder = {session_key: state.event}
+            merge_pending_message_event(holder, session_key, event, merge_text=True)
             latest_message_id = getattr(event, "message_id", None)
             latest_anchor = latest_message_id or getattr(event, "reply_to_message_id", None)
             if latest_message_id is not None:
@@ -3794,6 +3889,7 @@ class BasePlatformAdapter(ABC):
         state.cancel_timer()
         delay = self._text_debounce_delay(session_key)
         state.task = asyncio.create_task(self._flush_text_debounce(session_key, delay))
+        return True
 
     async def _flush_text_debounce(self, session_key: str, delay: float) -> None:
         """Timer task that flushes the debounced text buffer."""
@@ -4055,7 +4151,7 @@ class BasePlatformAdapter(ABC):
             logger.debug("[%s] New text message while session %s is active — "
                          "debouncing follow-up (busy_text_mode=queue, window=%.2fs)", self.name,
                          session_key, self._busy_text_debounce_seconds)
-            await self._queue_text_debounce(session_key, event)
+            event._gateway_accepted = await self._queue_text_debounce(session_key, event)
         else:
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
@@ -4438,6 +4534,7 @@ class BasePlatformAdapter(ABC):
     async def _process_message_background(self, event: MessageEvent, session_key: str) -> None:
         """Background task that actually processes the message."""
         delivery_attempted = delivery_succeeded = False  # feeds the processing-complete hook
+        turn_outcome = "completed"  # explicit: the except branches below downgrade it, nothing infers it
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -4531,12 +4628,14 @@ class BasePlatformAdapter(ABC):
                 self._spawn_drain_task(pending_event, session_key)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:
+            turn_outcome = "cancelled"
             expected = asyncio.current_task() in self._expected_cancelled_tasks
             await self._run_processing_hook(
                 "on_processing_complete", event,
                 ProcessingOutcome.CANCELLED if expected else ProcessingOutcome.FAILURE)
             raise
         except BaseException as e:
+            turn_outcome = "cancelled" if isinstance(e, (SystemExit, KeyboardInterrupt)) else "failed"
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             _thread_metadata = (await self._notify_turn_error(event, e)) or _thread_metadata
@@ -4550,12 +4649,27 @@ class BasePlatformAdapter(ABC):
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
             await self._fire_post_delivery_callback(session_key, interrupt_event)
+            # Generic completion seam: fires after the turn ACTUALLY ran (not when it was merely
+            # scheduled). A cancelled/interrupted run reports "cancelled" so durable owners re-drive it.
+            await self._fire_event_completion(event, turn_outcome)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)
+
+    async def _fire_event_completion(self, event: MessageEvent, outcome: str) -> None:
+        """Run the event's optional ``on_complete(outcome)`` hook (sync or async); never raises."""
+        hook = getattr(event, "on_complete", None)
+        if not callable(hook):
+            return
+        try:
+            result = hook(outcome)
+            if inspect.isawaitable(result):
+                await result
+        except BaseException:
+            logger.warning("on_complete hook failed (outcome=%s)", outcome, exc_info=True)
 
     def _spawn_drain_task(self, pending_event: MessageEvent, session_key: str) -> None:
         """Hand the session to a fresh task for a queued follow-up — never recurse (chained

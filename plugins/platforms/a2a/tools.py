@@ -43,7 +43,9 @@ def _resolve_peer(agent: str) -> Optional[dict]:
     if agent.startswith(("http://", "https://")):
         return {"url": agent, "auth": {}, "timeout": _DEFAULT_TIMEOUT, "capabilities": []}
     entry = _configured_peers().get(agent)
-    return _peer_from_entry(entry, capabilities=entry.get("capabilities", []) or [], tenant=entry.get("tenant", "")) if entry else None
+    return _peer_from_entry(entry, capabilities=entry.get("capabilities", []) or [], tenant=entry.get("tenant", ""),
+                                            telegram_thread=entry.get("telegram_thread"),
+                                            profile=entry.get("profile")) if entry else None
 
 
 def _auth_header(auth: dict) -> dict:
@@ -93,7 +95,9 @@ def _rpc_url(base_url: str, card: Optional[dict]) -> str:
     return base_url.rstrip("/")
 
 
-def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> tuple[str, str, str]:
+def _send_task(agent_label: str, peer: dict, message: str, context_id: str,
+               envelope: Any = None, reply_receiver: Any = None,
+               admission_sink: Optional[dict] = None) -> tuple[str, str, str]:
     """One SendMessage to a peer -> (reply_text, context_id, state). Raises urllib errors /
     ValueError for the caller to format; handles redaction, audit, persistence, metrics."""
     base_url = peer.get("url", "")
@@ -104,16 +108,25 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     except Exception:
         card = None
     ctx = context_id or protocol.new_context_id()
-    safe_message = security.redact_outbound(message)
+    from tools.bot_thread_sync import mask_text
+    # A conversational envelope is already masked by ThreadSync; its text must travel unchanged
+    # so the receiver's digest/proof check holds.
+    safe_message = envelope.text if envelope is not None else mask_text(security.redact_outbound(message)).text
     # v1.0: contextId lives inside the Message, not at the params top level.
+    wire_message = protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)
+    wire_message_id = str(wire_message.get("messageId") or "")
     rpc_body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "SendMessage",
-                "params": {"message": protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)}}
+                "params": {"message": wire_message}}
     iface = _select_jsonrpc_interface(card)
     tenant = str(iface["tenant"]) if iface and iface.get("tenant") else str(peer.get("tenant") or "")
     if tenant:
         rpc_body["params"]["tenant"] = tenant
+    if envelope is not None:
+        rpc_body["params"].update({"art": "gespraech", "thread_contract": envelope.to_wire()})
+    else:
+        rpc_body["params"]["art"] = "arbeitsauftrag"  # explicit work task: legacy path, never ThreadSync
     security.audit("outbound", agent_label, rpc_body["id"], safe_message)
-    protocol.persist_message(ctx, "user", safe_message, rpc_body["id"])
+    protocol.persist_message(ctx, "user", safe_message, wire_message_id)
     protocol.metrics.outbound_total += 1
     resp = _http_post_json(_rpc_url(base_url, card), rpc_body, headers, timeout)
     if "error" in resp:
@@ -124,6 +137,34 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str) -> t
     if isinstance(payload, dict):
         reply_ctx = payload.get("contextId", ctx)
         state = (payload.get("status") or {}).get("state", "")
+    if reply_ctx != ctx:
+        raise ValueError("a2a_id_unbelegt: peer changed contextId")
+    receipt = None
+    if envelope is not None:
+        # "Delivered" requires the recipient's durable admission receipt for exactly THIS envelope. A
+        # task state alone (or a transport that merely returned) proves nothing: without it the sender
+        # keeps the message queued and retries.
+        receipt = (payload.get("metadata") or {}).get("thread_admission") if isinstance(payload, dict) else None
+        if not (isinstance(receipt, dict) and receipt.get("message_id") == envelope.message_id
+                and receipt.get("envelope_digest") == envelope.digest
+                and receipt.get("status") in {"admitted", "queued", "duplicate"}):
+            raise RuntimeError("admission_unbelegt: recipient did not durably admit the message")
+        if admission_sink is not None:
+            admission_sink.update(receipt)
+    if envelope is None:
+        reply = mask_text(security.redact_outbound(reply)).text
+    elif reply_receiver is None:
+        reply = ""  # no authenticated receiver (background redelivery): never expose unvalidated text
+    elif not isinstance((payload.get("metadata") or {}).get("thread_contract"), dict) \
+            and receipt["status"] in {"queued", "duplicate"}:
+        reply = ""  # the recipient holds the message durably; its reply does not arrive over this call
+    else:
+        # Generic masking is not authority: the peer's complete reply envelope must validate and be
+        # re-scanned by THIS side's ThreadSync before any reply text is exposed.
+        contract = (payload.get("metadata") or {}).get("thread_contract") if isinstance(payload, dict) else None
+        if not isinstance(contract, dict):
+            raise ValueError("reply_unbelegt: missing thread_contract")
+        reply = reply_receiver(contract, reply)
     protocol.persist_message(reply_ctx, "agent", reply, rpc_body["id"])
     protocol.metrics.inbound_total += 1
     return reply, reply_ctx, state
@@ -170,7 +211,7 @@ def a2a_discover(args: dict, **_: Any) -> str:
     return "\n".join(lines)
 
 
-def a2a_call(args: dict, **_: Any) -> str:
+def a2a_call(args: dict, **kw: Any) -> str:
     """Send a task to a peer (configured name or direct URL); ``context_id`` continues a prior exchange."""
     # Accept common aliases models reach for (observed live: 'agent_name').
     agent = str(args.get("agent") or args.get("agent_name") or args.get("name") or "").strip()
@@ -181,7 +222,13 @@ def a2a_call(args: dict, **_: Any) -> str:
     peer = _resolve_peer(agent)
     if not peer or not peer.get("url"):
         return f"Error: unknown agent '{agent}'. Configure it under 'a2a_agents' in config.yaml or pass a full http(s):// URL."
+    art = str(args.get("art") or "gespraech").lower()  # missing art = conversation (approved spec)
+    if art not in {"gespraech", "arbeitsauftrag"}:
+        return "Error: 'art' must be 'gespraech' or 'arbeitsauftrag'."
+    conversational = art == "gespraech"
     try:
+        if conversational:
+            return _conversational_call(agent, peer, message, kw.get("agent"))
         reply, reply_ctx, state = _send_task(agent, peer, message, context_id)
     except urllib.error.HTTPError as e:
         return _HTTP_CALL_ERRORS.get(e.code, "Error: call to '{agent}' failed — HTTP {code}.").format(agent=agent, code=e.code)
@@ -195,6 +242,46 @@ def a2a_call(args: dict, **_: Any) -> str:
     if state == protocol.STATE_INPUT_REQUIRED:
         body += f"\n\n(The peer needs more input — answer by calling a2a_call again with context_id '{reply_ctx}'.)"
     return f"{header}\n{body}"
+
+
+def _conversational_call(label: str, peer: dict, message: str, calling_agent: Any) -> str:
+    """Conversation path: the authenticated ThreadSync capability masks, projects the sender thread,
+    then transports the COMPLETE envelope. Work tasks (art=arbeitsauftrag) never come here."""
+    capability = getattr(calling_agent, "_thread_sync_capability", None)
+    thread = peer.get("telegram_thread")
+    if capability is None or not isinstance(thread, dict):
+        return "Error: adapter_unbelegt: conversational A2A requires an authenticated ThreadSync and a peer telegram_thread."
+    from tools.bot_thread_sync import ThreadEnvelope
+    box: dict[str, str] = {}
+
+    def wire(payload: dict) -> None:
+        envelope = ThreadEnvelope.from_payload(payload)
+
+        def receiver(contract: dict, text: str) -> str:
+            result, clean = capability.receive_reply(contract, original=envelope, text=text)
+            if clean is None:
+                raise ValueError(f"reply_unbelegt: {result.reason or result.status}")
+            return clean
+
+        try:
+            reply, _ctx, state = _send_task(label, peer, envelope.text, envelope.conversation_id,
+                                            envelope=envelope, reply_receiver=receiver, admission_sink=box)
+        except ValueError as exc:
+            if not str(exc).startswith("reply_unbelegt"):
+                raise
+            box["error"] = str(exc)  # the message WAS delivered; only the reply is withheld (no resend)
+            return
+        box.update(reply=reply, state=state)
+
+    result = capability.send(target=label, message=message, transport="a2a", peer_thread=thread, wire_transport=wire,
+                             recipient=peer.get("profile") or label)
+    if result.status != "sent":
+        return f"[{label} · {result.status}] {result.reason}"
+    if box.get("error"):
+        return f"[{label} · reply withheld] {box['error']}"
+    if box.get("status") in {"queued", "duplicate"} and not box.get("reply"):
+        return f"[{label} · accepted] recipient holds the message durably ({box['status']}); reply pending"
+    return f"[{label} · conversation]\n{box.get('reply') or '(no text reply)'}"
 
 
 def a2a_list(args: dict | None = None, **_: Any) -> str:
@@ -306,7 +393,11 @@ _TOOLS: dict[str, tuple[Any, str, dict, list[str]]] = {
                  "reply to continue a multi-turn exchange.",
                  {"agent": _str("Configured peer name (from a2a_agents) or a full http(s):// URL."),
                   "message": _str("The task / message to send the peer, in natural language."),
-                  "context_id": _str("Optional: context id from a prior reply, to continue the conversation.")},
+                  "context_id": _str("Optional: context id from a prior reply, to continue the conversation."),
+                  "art": {"type": "string", "enum": ["gespraech", "arbeitsauftrag"],
+                          "description": "'gespraech' (default): conversation, mirrored into both Telegram threads "
+                                         "through the authenticated ThreadSync. 'arbeitsauftrag': ordinary A2A "
+                                         "work task, no Telegram projection."}},
                  ["agent", "message"]),
     "a2a_list": (a2a_list, "List configured A2A peer agents, persisted A2A conversations, and metrics.", {}, []),
     "a2a_history": (a2a_history,

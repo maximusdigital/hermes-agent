@@ -146,7 +146,9 @@ def test_write_reply_validates_envelope_id(root):
         bot_relay.write_reply(root, "../../etc/passwd", reply="x")
     path = bot_relay.write_reply(root, "a" * 32, reply="pong")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert data["reply"] == "pong" and not data["error"]
+    payload = json.loads((bot_relay.relay_root(root) / data["payload_ref"]).read_text(encoding="utf-8"))
+    assert "reply" not in data and "error" not in data
+    assert payload["value"] == "pong" and payload["error"] == ""
 
 
 def test_write_reply_keeps_the_first_settled_reply_for_an_envelope(root):
@@ -157,14 +159,16 @@ def test_write_reply_keeps_the_first_settled_reply_for_an_envelope(root):
     second = bot_relay.write_reply(root, env_id, error="target busy", reason="target_busy")
     assert second == first
     record = json.loads(first.read_text(encoding="utf-8"))
-    assert (record["reply"], record["error"], record["reason"]) == ("the answer", "", "")
+    payload = json.loads((bot_relay.relay_root(root) / record["payload_ref"]).read_text(encoding="utf-8"))
+    assert (payload["value"], payload["error"], record["reason"]) == ("the answer", "", "")
 
 
 def test_write_reply_reason_passthrough_and_classification(root):
     # explicit reason is persisted verbatim
     path = bot_relay.write_reply(root, "c" * 32, error="boom", reason="delivery_timeout")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert data["reason"] == "delivery_timeout" and data["error"] == "boom"
+    payload = json.loads((bot_relay.relay_root(root) / data["payload_ref"]).read_text(encoding="utf-8"))
+    assert data["reason"] == "delivery_timeout" and "error" not in data and payload["error"] == "boom"
     # no reason given → classified from error text
     path = bot_relay.write_reply(root, "d" * 32, error="Error code: 429 - rate limit")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -172,7 +176,8 @@ def test_write_reply_reason_passthrough_and_classification(root):
     # success reply carries an empty reason
     path = bot_relay.write_reply(root, "e" * 32, reply="ok")
     data = json.loads(Path(path).read_text(encoding="utf-8"))
-    assert data["reason"] == "" and data["reply"] == "ok"
+    payload = json.loads((bot_relay.relay_root(root) / data["payload_ref"]).read_text(encoding="utf-8"))
+    assert data["reason"] == "" and "reply" not in data and payload["value"] == "ok"
 
 
 def test_waiter_is_a_runner_entrypoint_the_approval_gate_lets_through(root):
@@ -231,7 +236,8 @@ def test_waiter_prints_the_completion_notification_the_sender_wakes_on(root, cap
     reply_path = bot_relay.relay_root(root) / bot_relay.REPLIES_DIR / f"{env['id']}.json"
     reply_path.parent.mkdir(parents=True, exist_ok=True)
     if reply_file is not None:
-        reply_path.write_text(json.dumps(reply_file), encoding="utf-8")
+        bot_relay.write_reply(root, env["id"], reply=reply_file.get("reply", ""),
+                              error=reply_file.get("error", ""), reason=reply_file.get("reason", ""))
 
     code = bot_mode_dm._delivery_main(["--wait-reply", str(reply_path), "@researcher on ssh-vps", "0.3"])
 
@@ -274,7 +280,7 @@ def test_hostile_roster_fields_ride_as_argv_data(root):
     assert parts[4] == f"@researcher on {inj}"
     reply_path = bot_relay.relay_root(root) / bot_relay.REPLIES_DIR / f"{env['id']}.json"
     reply_path.parent.mkdir(parents=True, exist_ok=True)
-    reply_path.write_text(json.dumps({"reply": "pong"}), encoding="utf-8")
+    bot_relay.write_reply(root, env["id"], reply="pong")
     proc = subprocess.run(parts, capture_output=True, text=True, timeout=30)
 
     assert proc.returncode == 0 and proc.stdout.splitlines() == [f"Reply from @researcher on {inj}:", "pong"]
@@ -365,7 +371,7 @@ def test_relay_route_queues_envelope_and_spawns_waiter(tmp_path, monkeypatch):
 
     monkeypatch.setattr("tools.bot_mode_dm._spawn_delivery", _fake_spawn)
     agent = _FakeAgent(home)
-    out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
+    out = json.loads(message_agent_tool(target="hermes", message="ping", art="arbeitsauftrag", agent=agent))
     assert out.get("status") == "queued"
     assert "Hermes Cloud" in spawned["label"]
     # envelope landed in the outbox with attribution prefixed
@@ -389,10 +395,10 @@ def test_relay_route_ambiguous_target_errors_with_forms(tmp_path, monkeypatch):
         lambda *a, **k: json.dumps({"status": "queued"}),
     )
     agent = _FakeAgent(home)
-    out = json.loads(message_agent_tool(target="scout", message="hi", agent=agent))
+    out = json.loads(message_agent_tool(target="scout", message="hi", art="arbeitsauftrag", agent=agent))
     assert "scout@cloud-1" in out.get("error", "") and "scout@ssh-vps" in out["error"]
     # connection-qualified form goes through
-    out2 = json.loads(message_agent_tool(target="scout@ssh-vps", message="hi", agent=agent))
+    out2 = json.loads(message_agent_tool(target="scout@ssh-vps", message="hi", art="arbeitsauftrag", agent=agent))
     assert out2.get("status") == "queued"
 
 
@@ -418,12 +424,12 @@ def test_remote_default_is_addressable_by_its_title_slug(tmp_path, monkeypatch):
         # an exact handle beats a colliding title slug; the collided title falls back to the qualified form
         assert forms == {"cloud-1/cos-bot": "cos-bot", "vps-1/default": "hermes@vps-1", "cloud-1/default": "ops-bot"}
         assert bot_relay.resolve_remote_target("cos-bot", roster)["profile"] == "cos-bot"
-    out = json.loads(message_agent_tool(target="@ops-bot", message="ping", agent=agent))
+    out = json.loads(message_agent_tool(target="@ops-bot", message="ping", art="arbeitsauftrag", agent=agent))
     assert out.get("status") == "queued"
     [env] = bot_relay.claim_pending_envelopes(home)
     assert (env["target_connection"], env["target_profile"]) == ("cloud-1", "default")
     # a bare @hermes from the local default is the two remote defaults — offered under their reply-safe forms
-    err = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))["error"]
+    err = json.loads(message_agent_tool(target="hermes", message="ping", art="arbeitsauftrag", agent=agent))["error"]
     assert "hermes@vps-1" in err and "ops-bot" in err
     section = bot_mode_probe.get_bot_mode_protocol_section(home)
     assert "`@ops-bot`" in section and "`@hermes@vps-1`" in section and "- `@hermes` —" not in section
@@ -578,9 +584,9 @@ def test_drain_expires_old_envelope_with_queued_expired_reply(root):
     reply = json.loads(
         (base / bot_relay.REPLIES_DIR / f"{env['id']}.json").read_text(encoding="utf-8")
     )
-    assert reply["reason"] == "queued_expired"
-    assert reply["error"]
-    assert not reply["reply"]
+    assert reply["reason"] == "queued_expired" and "error" not in reply
+    payload = json.loads((base / reply["payload_ref"]).read_text(encoding="utf-8"))
+    assert payload["error"]
 
 
 def test_the_outbox_is_claimed_oldest_first(root):
@@ -655,7 +661,7 @@ def test_message_agent_surfaces_runtime_offline_refusal(tmp_path, monkeypatch):
         lambda *a, **k: json.dumps({"status": "queued"}),
     )
     agent = _FakeAgent(home)
-    out = json.loads(message_agent_tool(target="hermes", message="ping", agent=agent))
+    out = json.loads(message_agent_tool(target="hermes", message="ping", art="arbeitsauftrag", agent=agent))
     assert out.get("reason") == "runtime_offline"
     assert "offline" in out.get("error", "")
     # fail-fast means no envelope was queued
@@ -706,3 +712,19 @@ def test_delivery_env_carries_only_the_given_author(monkeypatch):
     assert "HERMES_SESSION_ID" not in env
     assert "HERMES_SESSION_PROFILE" not in env
     assert env["HERMES_SESSION_STALL_TIMEOUT"] == "97"
+
+
+def test_relay_mailbox_files_are_reference_only_and_recover_exact_payload(root):
+    """Crash recovery exposes the body only after resolving the immutable payload record."""
+    target = _target()
+    envelope = bot_relay.enqueue_envelope(root, target=target, message="RELAY_BODY_SENTINEL",
+                                          sender_profile="default", sender_handle="hermes")
+    base = bot_relay.relay_root(root)
+    for directory in (bot_relay.OUTBOX_DIR, bot_relay.CLAIMED_DIR):
+        assert "RELAY_BODY_SENTINEL" not in "".join(p.read_text() for p in (base / directory).glob("*.json"))
+    claimed = bot_relay.claim_pending_envelopes(root)
+    assert claimed[0]["message"] == "RELAY_BODY_SENTINEL"
+    bot_relay.write_reply(root, envelope["id"], reply="REPLY_BODY_SENTINEL")
+    reply = (base / bot_relay.REPLIES_DIR / f"{envelope['id']}.json").read_text()
+    assert "REPLY_BODY_SENTINEL" not in reply
+    assert "RELAY_BODY_SENTINEL" not in reply

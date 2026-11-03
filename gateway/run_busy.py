@@ -231,7 +231,15 @@ class GatewayBusySessionMixin:
                 metadata={
                     "platform": platform,
                     "chat_id": getattr(source, "chat_id", "") or "",
+                    "thread_id": getattr(source, "thread_id", "") or "",
                     "user_id": getattr(source, "user_id", "") or "",
+                    # The configured home channel is the only canonical live thread. Persist the
+                    # decision with the lease so an off-process delivery never guesses from chat text.
+                    "canonical_live_thread": bool(
+                        (home := getattr(getattr(self, "config", None), "get_home_channel", lambda _p: None)(source.platform))
+                        and str(getattr(home, "chat_id", "") or "") == str(getattr(source, "chat_id", "") or "")
+                        and str(getattr(home, "thread_id", "") or "") == str(getattr(source, "thread_id", "") or "")
+                    ),
                     # Writer identity: a leaked lease from this process is re-acquired by the next
                     # turn rather than fencing it out forever (pruning only reclaims dead PROCESSES).
                     # Writer identity for re-entrancy (#94595): if this process leaks a lease for this

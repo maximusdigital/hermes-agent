@@ -61,6 +61,77 @@ def find_canonical_live_owner(profile_home: Path | str) -> dict[str, Any] | None
     return None
 
 
+def find_canonical_live_thread(profile_home: Path | str) -> dict[str, Any] | None:
+    """Return the exact configured home-thread owner, never an arbitrary live chat.
+
+    Gateway leases persist this decision at admission.  Requiring one live lease keeps
+    stale, ambiguous, and cross-profile rows fail-closed.
+    """
+    from hermes_cli.active_sessions import active_session_registry_snapshot
+
+    home = Path(profile_home).resolve()
+    configured = None
+    try:
+        from gateway.config import Platform, load_gateway_config
+        config = load_gateway_config()
+        configured = config.get_home_channel(Platform.TELEGRAM)
+    except Exception:
+        configured = None
+    candidates = []
+    for entry in active_session_registry_snapshot(registry_home=home, strict=True):
+        metadata = entry.get("metadata") or {}
+        canonical = metadata.get("canonical_live_thread") is True
+        if not canonical and metadata.get("platform") == "telegram" and configured is not None:
+            canonical = (
+                str(metadata.get("chat_id") or "") == str(getattr(configured, "chat_id", "") or "")
+                and str(metadata.get("thread_id") or "") == str(getattr(configured, "thread_id", "") or "")
+            )
+        if canonical:
+            candidates.append({
+                "profile_home": str(home),
+                "session_id": str(entry.get("session_id") or ""),
+                "lease_id": str(entry.get("lease_id") or ""),
+                "live_session_id": str(metadata.get("live_session_id") or ""),
+                "platform": str(metadata.get("platform") or ""),
+                "chat_id": str(metadata.get("chat_id") or ""),
+                "thread_id": str(metadata.get("thread_id") or "") or None,
+                "user_id": str(metadata.get("user_id") or "") or None,
+            })
+    return (candidates[0] if len(candidates) == 1
+            and all(candidates[0].get(key) for key in
+                    ("profile_home", "session_id", "lease_id", "live_session_id", "platform", "chat_id"))
+            else None)
+
+
+def _send_canonical_thread_message(owner: dict[str, Any], message: str) -> dict[str, Any]:
+    """Send through the existing platform sender, then correlate the exact session row."""
+    from gateway.config import Platform, load_gateway_config
+
+    from model_tools import _run_async
+    from tools.send_message_tool import _resolve_platform_config, _send_to_platform
+    from tools.bot_thread_sync import mask_text
+
+    # The live-delivery mailbox is legacy transport infrastructure; the thread edge
+    # still applies the same fail-closed local scan before projecting content.
+    masked = mask_text(message)
+    message = masked.text
+
+    platform_name = str(owner.get("platform") or "").lower()
+    platform = Platform(platform_name)
+    config = load_gateway_config()
+    _platform, pconfig, _entry, error = _resolve_platform_config(platform_name, config)
+    if error or pconfig is None:
+        return {"success": False, "error": error or "platform unavailable"}
+    result = _run_async(_send_to_platform(
+        platform, pconfig, str(owner["chat_id"]), message,
+        thread_id=owner.get("thread_id"), media_files=[], force_document=False,
+    ))
+    if not isinstance(result, dict) or not result.get("success"):
+        return result if isinstance(result, dict) else {"success": False, "error": "send failed"}
+    result["masking"] = {"provenance": masked.provenance, "match_count": masked.match_count}
+    return result
+
+
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
     pinned = {key: owner.get(key) for key in _OWNER_KEYS}
     if not all(isinstance(value, str) and value for value in pinned.values()):

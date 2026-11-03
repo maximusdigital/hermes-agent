@@ -151,14 +151,17 @@ def test_schema_never_in_global_registry():
         assert bot_mode_dm.MESSAGE_AGENT_TOOL_NAME not in names
 
 
-# ── dispatch gate (defense in depth) ─────────────────────────────────────────
+def _task_message_agent(*args, **kwargs):
+    """Legacy Bot Chat transport tests exercise explicit work-task compatibility."""
+    kwargs.setdefault("art", "arbeitsauftrag")
+    return bot_mode_dm.message_agent_tool(*args, **kwargs)
 
 
 def test_tool_refuses_outside_bot_chat(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Ordinary chat")
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+        _task_message_agent(target="researcher", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert "error" in result
     assert "Bot Chat" in result["error"]
@@ -169,7 +172,7 @@ def test_tool_refuses_on_unmanaged_install(tmp_path):
     home.mkdir()
     agent = _FakeAgent(home, title="Bot Chat")
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+        _task_message_agent(target="researcher", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert "error" in result
 
@@ -181,7 +184,7 @@ def test_unknown_target_lists_roster(tmp_path):
     home = _managed_home(tmp_path, teammates=("researcher", "coder"))
     agent = _FakeAgent(home, title="Bot Chat")
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="nosuchbot", message="hi", agent=agent)
+        _task_message_agent(target="nosuchbot", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert "error" in result
     assert set(result["teammates"]) == {"researcher", "coder"}
@@ -191,7 +194,7 @@ def test_cannot_message_self(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")  # default profile
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="hermes", message="hi", agent=agent)
+        _task_message_agent(target="hermes", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert "error" in result
     assert "yourself" in result["error"]
@@ -201,11 +204,11 @@ def test_empty_and_oversized_message_rejected(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")
     assert "error" in json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="  ", agent=agent)
+        _task_message_agent(target="researcher", message="  ", art="arbeitsauftrag", agent=agent)
     )
     big = "x" * (bot_mode_dm.MESSAGE_MAX_CHARS + 1)
     assert "error" in json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message=big, agent=agent)
+        _task_message_agent(target="researcher", message=big, art="arbeitsauftrag", agent=agent)
     )
 
 
@@ -213,7 +216,7 @@ def test_unregistered_peer_rejected(tmp_path):
     home = _managed_home(tmp_path, peers=("spark",))
     agent = _FakeAgent(home, title="Bot Chat")
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="homelab/coder", message="hi", agent=agent)
+        _task_message_agent(target="homelab/coder", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert "error" in result
     assert result["peers"] == ["spark"]
@@ -303,7 +306,7 @@ def test_local_delivery_command_and_ack(tmp_path, monkeypatch):
     agent = _FakeAgent(home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(
+        _task_message_agent(
             target="@researcher",
             message=(
                 'status? give me the "PAYLOAD_SENTINEL_7A91" numbers '
@@ -369,7 +372,7 @@ def test_native_local_delivery_bypasses_terminal_approval(tmp_path, monkeypatch)
         f"cat {home / 'profiles' / 'researcher' / 'profile.yaml'}", "local"
     )
     assert blocked["approved"] is False
-    result = json.loads(bot_mode_dm.message_agent_tool(
+    result = json.loads(_task_message_agent(
         target="researcher", message="native payload", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     assert calls[0]["_native_argv"][:2] == [sys.executable, str(Path(bot_mode_dm.__file__).resolve())]
@@ -467,7 +470,7 @@ def test_cli_runner_ack_is_queued_with_the_runner_delivery_id(tmp_path, monkeypa
 
     calls = _capture_spawn(monkeypatch)
     home = _managed_home(tmp_path, teammates=("researcher",))
-    result = json.loads(bot_mode_dm.message_agent_tool(
+    result = json.loads(_task_message_agent(
         target="researcher", message="hi", agent=_FakeAgent(home, title="Bot Chat")))
 
     assert result["status"] == "queued"
@@ -482,7 +485,7 @@ def test_relay_ack_is_queued_with_the_envelope_id(tmp_path, monkeypatch):
     bot_relay.write_remote_roster(home, [
         {"profile": "default", "handle": "hermes", "connection_id": "cloud-1", "connection_label": "Hermes Cloud"},
     ])
-    result = json.loads(bot_mode_dm.message_agent_tool(target="hermes", message="ping", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent(target="hermes", message="ping", agent=_FakeAgent(home)))
 
     assert result["status"] == "queued"
     (envelope,) = bot_relay.claim_pending_envelopes(home)
@@ -511,7 +514,7 @@ def test_friendly_names_and_desktop_slugs_resolve_to_folder_ids(tmp_path, monkey
     expected = {"Scribe": "writer", "@scribe": "writer", "Dr. Foo": "foo", "dr-foo": "foo", "drfoo": "foo",
                 "Builder": "builder"}[target]
 
-    result = json.loads(bot_mode_dm.message_agent_tool(target=target, message="ping", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent(target=target, message="ping", agent=_FakeAgent(home)))
 
     assert result["status"] == "queued", result
     assert result["to"] == f"@{expected}"
@@ -528,8 +531,8 @@ def test_ambiguous_friendly_name_fails_closed(tmp_path, monkeypatch):
     _rename(home, "bbb", display_name="Scribe")
     _rename(home, "ops", display_name="Hermes")
 
-    ambiguous = json.loads(bot_mode_dm.message_agent_tool(target="Scribe", message="ping", agent=_FakeAgent(home)))
-    hijack = json.loads(bot_mode_dm.message_agent_tool(target="hermes", message="ping",
+    ambiguous = json.loads(_task_message_agent(target="Scribe", message="ping", agent=_FakeAgent(home)))
+    hijack = json.loads(_task_message_agent(target="hermes", message="ping",
                                                        agent=_FakeAgent(home / "profiles" / "aaa")))
 
     assert "error" in ambiguous
@@ -557,7 +560,7 @@ def test_peer_delivery_command_pins_registry_profile_for_secondary_bots(
     agent = _FakeAgent(reviewer_home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
+        _task_message_agent(target="spark", message="ping", art="arbeitsauftrag", agent=agent)
     )
     assert result["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
@@ -575,7 +578,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
     agent = _FakeAgent(home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark/researcher", message="ping", agent=agent)
+        _task_message_agent(target="spark/researcher", message="ping", art="arbeitsauftrag", agent=agent)
     )
     assert result["status"] == "queued"
     assert "spark" in result["to"]
@@ -587,7 +590,7 @@ def test_peer_delivery_command(tmp_path, monkeypatch):
 
     # bare peer name targets the peer's main agent
     result2 = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
+        _task_message_agent(target="spark", message="ping", art="arbeitsauftrag", agent=agent)
     )
     assert result2["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
@@ -600,7 +603,7 @@ def test_peer_delivery_does_not_construct_local_delivery_env(tmp_path, monkeypat
     monkeypatch.setattr(bot_relay, "_hermes_cli", lambda: "hermes")
     monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: pytest.fail("peer env must be built by runner"))
     home = _managed_home(tmp_path, peers=("spark",))
-    result = json.loads(bot_mode_dm.message_agent_tool("spark", "ping", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent("spark", "ping", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     assert _runner_parts(calls[0]["command"])[0] == "stdin"
 
@@ -609,7 +612,7 @@ def test_delivery_env_failure_cleans_up_payload(tmp_path, monkeypatch):
     home = _managed_home(tmp_path, teammates=("researcher",))
     monkeypatch.setattr(bot_relay, "delivery_env", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("env failed")))
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
-    result = json.loads(bot_mode_dm.message_agent_tool("researcher", "secret", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent("researcher", "secret", agent=_FakeAgent(home)))
     assert "error" in result
     assert not list(tmp_path.glob("dm-*.txt"))
 
@@ -630,7 +633,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
     agent = _FakeAgent(home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="ping", agent=agent)
+        _task_message_agent(target="researcher", message="ping", art="arbeitsauftrag", agent=agent)
     )
     assert result["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[0]["command"])
@@ -640,7 +643,7 @@ def test_delivery_pins_the_hermes_entrypoint_beside_this_interpreter(tmp_path, m
                                   "--create-if-missing", "-Q"]
 
     result2 = json.loads(
-        bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent)
+        _task_message_agent(target="spark", message="ping", art="arbeitsauftrag", agent=agent)
     )
     assert result2["status"] == "queued"
     mode, _dm_file, transport_argv = _runner_parts(calls[1]["command"])
@@ -656,8 +659,8 @@ def test_peer_delivery_author_carries_the_sender_hostname_and_local_stays_bare(t
     home = _managed_home(tmp_path, teammates=("researcher", "coder"), peers=("spark",))
     agent = _FakeAgent(home / "profiles" / "coder", title="Bot Chat")
 
-    assert json.loads(bot_mode_dm.message_agent_tool(target="spark", message="ping", agent=agent))["status"] == "queued"
-    assert json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="ping", agent=agent))["status"] == "queued"
+    assert json.loads(_task_message_agent(target="spark", message="ping", art="arbeitsauftrag", agent=agent))["status"] == "queued"
+    assert json.loads(_task_message_agent(target="researcher", message="ping", art="arbeitsauftrag", agent=agent))["status"] == "queued"
 
     assert _runner_author(calls[0]["command"]) == {"id": "bot:erimac.local/coder", "name": "coder", "is_bot": True}
     assert _runner_author(calls[1]["command"]) == {"id": "bot:coder", "name": "coder", "is_bot": True}
@@ -673,14 +676,14 @@ def test_renamed_primary_signs_with_its_friendly_name_and_is_reachable_by_it(tmp
     home = _managed_home(tmp_path, teammates=("coder",))
     (home / "profile.yaml").write_text("display_name: Maia\n", encoding="utf-8")
 
-    result = json.loads(bot_mode_dm.message_agent_tool(target="coder", message="hi", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent(target="coder", message="hi", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     _mode, dm_file, _argv = _runner_parts(calls[0]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith("Message from 🤖 Maia (@hermes): ")
 
     coder = _FakeAgent(home / "profiles" / "coder")
     for target in ("maia", "@maia", "@hermes"):
-        result = json.loads(bot_mode_dm.message_agent_tool(target=target, message="pong", agent=coder))
+        result = json.loads(_task_message_agent(target=target, message="pong", agent=coder))
         assert result["status"] == "queued", (target, result)
         _mode, _dm_file, argv = _runner_parts(calls[-1]["command"])
         assert argv[1:3] == ["-p", "default"], (target, argv)
@@ -688,7 +691,7 @@ def test_renamed_primary_signs_with_its_friendly_name_and_is_reachable_by_it(tmp
     (home / "profile.yaml").write_text(
         "display_name: Maia\nui_meta:\n  hermes-bots:\n    title: Maia Prime\n", encoding="utf-8"
     )
-    json.loads(bot_mode_dm.message_agent_tool(target="coder", message="hi", agent=_FakeAgent(home)))
+    json.loads(_task_message_agent(target="coder", message="hi", agent=_FakeAgent(home)))
     _mode, dm_file, _argv = _runner_parts(calls[-1]["command"])
     assert Path(dm_file).read_text(encoding="utf-8").startswith("Message from 🤖 Maia Prime (@hermes): ")
 
@@ -701,7 +704,7 @@ def test_named_profile_sender_prefix(tmp_path, monkeypatch):
     agent = _FakeAgent(profile_home, title="Bot Chat")
 
     result = json.loads(
-        bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent)
+        _task_message_agent(target="researcher", message="hi", art="arbeitsauftrag", agent=agent)
     )
     assert result["status"] == "queued"
     _mode, dm_file, _transport_argv = _runner_parts(calls[0]["command"])
@@ -727,7 +730,7 @@ def test_live_dm_admitted_before_waiter_failure(tmp_path, monkeypatch):
     import tools.terminal_tool as terminal
     monkeypatch.setattr(terminal, "terminal_tool", lambda *a, **k: json.dumps({"error": "spawn failed"}))
 
-    result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent("researcher", "hello", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     record = live.read_delivery_result(target, result["delivery_id"])
     assert record is not None
@@ -1197,7 +1200,7 @@ def test_ack_names_poll_return_path_when_session_cannot_receive_completions(tmp_
     promise a completion notification; it names the surface-supported return path instead."""
     _patch_non_push_native(monkeypatch, "proc_np1")
     home = _managed_home(tmp_path, teammates=("researcher",))
-    result = json.loads(bot_mode_dm.message_agent_tool(
+    result = json.loads(_task_message_agent(
         target="researcher", message="hi", agent=_FakeAgent(home, title="Bot Chat")))
 
     assert result["status"] == "queued"
@@ -1218,7 +1221,7 @@ def test_live_owner_ack_carries_the_poll_return_path_when_session_cannot_receive
     monkeypatch.setattr(bot_mode_dm, "_dm_dir", lambda: tmp_path)
     _patch_non_push_native(monkeypatch, "proc_np2")
 
-    result = json.loads(bot_mode_dm.message_agent_tool("researcher", "hello", agent=_FakeAgent(home)))
+    result = json.loads(_task_message_agent("researcher", "hello", agent=_FakeAgent(home)))
     assert result["status"] == "queued"
     assert result["process_id"] == "proc_np2"
     assert result["reply_delivery"] == "poll"
@@ -1253,7 +1256,7 @@ def test_poll_reply_is_persisted_as_a_delivery_row_when_the_runner_exits(tmp_pat
     rows = []
     agent._session_db.append_message = lambda session_id, role, **kw: rows.append((session_id, role, kw)) or 1
 
-    result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=agent))
+    result = json.loads(_task_message_agent(target="researcher", message="hi", art="arbeitsauftrag", agent=agent))
     assert result["reply_delivery"] == "poll"
     deadline = time.monotonic() + 10
     while not rows and time.monotonic() < deadline:
@@ -1291,6 +1294,40 @@ def test_local_turn_relays_utf8_reply_under_a_gbk_default_codec(tmp_path, monkey
     # subprocess resolves an unspecified text-mode codec through _text_encoding() → locale.getencoding();
     # patch that seam since run_tests.sh's PYTHONUTF8=1 short-circuits the locale lookup.
     monkeypatch.setattr(subprocess, "_text_encoding", lambda: "gbk")
-
     assert bot_mode_dm._run_local_turn(argv, str(dm_file)) == 0
     assert reply in capsys.readouterr().out
+
+
+def test_conversational_message_agent_uses_capability_and_ignores_model_identity(tmp_path):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    agent = _FakeAgent(home)
+    calls = []
+
+    class Capability:
+        def send(self, **kw):
+            calls.append(kw)
+            return type("R", (), {"status": "sent", "reason": "", "message_id": "m", "attempts": 0})()
+
+    agent._thread_sync_capability = Capability()
+    result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hello", agent=agent))
+    assert result["status"] == "sent"
+    assert calls[0]["target"] == "researcher" and calls[0]["art"] == "gespraech"
+    assert not ({"tenant", "message_id", "conversation_id", "source_thread", "target_thread"} & set(calls[0]))
+
+
+def test_conversational_message_agent_without_capability_fails_closed_and_never_uses_bot_chat(tmp_path):
+    home = _managed_home(tmp_path, teammates=("researcher",))
+    out = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hi", agent=_FakeAgent(home)))
+    assert "adapter_unbelegt" in out["error"]
+
+
+def test_live_intent_file_holds_reference_and_digest_not_text(tmp_path, monkeypatch):
+    dm = tmp_path / "dm-x.txt"
+    dm.write_text("INTENT_SENTINEL_77", encoding="utf-8")
+    owner = {"profile_home": str(tmp_path), "session_id": "s", "lease_id": "l", "live_session_id": "v"}
+    import tools.bot_live_delivery as bld
+    monkeypatch.setattr(bld, "find_canonical_live_owner", lambda home: owner)
+    monkeypatch.setattr(bld, "read_delivery_result", lambda *_: {"status": "queued", "profile_home": str(tmp_path)})
+    bot_mode_dm._admit_live_dm(tmp_path, str(dm))
+    intent = (tmp_path / "dm-x.txt.live.json").read_text()
+    assert "INTENT_SENTINEL_77" not in intent and "payload_digest" in intent

@@ -1166,6 +1166,10 @@ class TurnRunner:
                     cache[ctx.session_key] = (agent, sig, msg_count, ctx.session_id)
                     runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, sig)
+        # Authority is per turn: a cached agent never keeps the previous turn's capability.
+        from gateway.run_thread_context import refresh_thread_capability
+        refresh_thread_capability(agent, runner=runner, source=ctx.source, session_id=ctx.session_id or "",
+                                  session_key=ctx.session_key or "", user_config=ctx.user_config)
         return agent, found.reused
 
     # ── per-turn agent wiring ───────────────────────────────────────────────────────────────

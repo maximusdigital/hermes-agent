@@ -14,6 +14,7 @@ when the target is definitively offline (fail fast instead of queueing a DM nobo
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ ROSTER_FILE = "roster.json"
 OUTBOX_DIR = "outbox"
 CLAIMED_DIR = "claimed"
 REPLIES_DIR = "replies"
+PAYLOADS_DIR = "payloads"
 LOCKS_DIR = "locks"
 
 # Config fallbacks (real knobs: ``bot_mode.turn_wait_seconds`` / ``bot_mode.envelope_ttl_seconds``).
@@ -103,9 +105,28 @@ def relay_root(root: Path | str) -> Path:
     return Path(root) / RELAY_DIR_NAME
 
 
+def _payload_write(root: Path | str, name: str, payload: dict, subdir: str = PAYLOADS_DIR) -> None:
+    """Payload/reply bodies are written and read only through pinned dir_fd/O_NOFOLLOW opens."""
+    from tools import pinned_fs
+    fd = pinned_fs.open_chain(root, (RELAY_DIR_NAME, subdir))
+    try:
+        pinned_fs.write_atomic(fd, name, json.dumps(payload, sort_keys=True).encode(), replace=True)
+    finally:
+        os.close(fd)
+
+
+def _payload_read(root: Path | str, name: str) -> dict:
+    from tools import pinned_fs
+    fd = pinned_fs.open_chain(root, (RELAY_DIR_NAME, PAYLOADS_DIR), create=False)
+    try:
+        return json.loads(pinned_fs.read_bytes(fd, name))
+    finally:
+        os.close(fd)
+
+
 def _ensure_dirs(root: Path | str) -> Path:
     base = relay_root(root)
-    for sub in (OUTBOX_DIR, CLAIMED_DIR, REPLIES_DIR):
+    for sub in (OUTBOX_DIR, CLAIMED_DIR, REPLIES_DIR, PAYLOADS_DIR):
         from hermes_constants import mkdir_under_hermes_home
         mkdir_under_hermes_home(base / sub)
     return base
@@ -299,14 +320,40 @@ def enqueue_envelope(root: Path | str, *, target: dict, message: str, sender_pro
         raise EnvelopeRefusedError("runtime_offline", f"{label} is offline right now — the message was NOT queued. "
                                    "Try again once that machine reconnects to the Desktop.")
     base = _ensure_dirs(root)
+    envelope_id = uuid.uuid4().hex
+    # Routing and audit files contain references only. The masked body is kept in
+    # the separately permissioned payload record and resolved by immutable id.
+    from tools.bot_thread_sync import mask_text
+    masked = mask_text(str(message))
+    _payload_write(root, f"{envelope_id}.json", {
+        "id": envelope_id, "kind": "message", "value": masked.text, "masking": masked.proof()})
     envelope = {
-        "id": uuid.uuid4().hex, "created_at": int(time.time()),
+        "id": envelope_id, "created_at": int(time.time()),
         "from_profile": sender_profile, "from_handle": sender_handle,
         "target_connection": target["connection_id"], "target_profile": target["profile"],
-        "target_handle": target["handle"], "message": message,
+        "target_handle": target["handle"], "payload_ref": f"{PAYLOADS_DIR}/{envelope_id}.json",
+        "payload_digest": hashlib.sha256(masked.text.encode()).hexdigest(),
     }
     _atomic_write_json(base / OUTBOX_DIR / f"{envelope['id']}.json", envelope)
     return envelope
+
+
+def resolve_payload(root: Path | str, envelope_id: str, *, kind: str = "message", expected_digest: str | None = None) -> str:
+    """Resolve the only allowed payload record for a relay reference."""
+    safe = str(envelope_id or "")
+    if not re.fullmatch(r"[0-9a-f]{32}", safe):
+        raise ValueError("invalid payload reference")
+    try:
+        data = _payload_read(root, f"{safe}.json")
+    except (ValueError, OSError):
+        raise ValueError("missing payload record")
+    if data.get("id") != safe or data.get("kind") != kind or not isinstance(data.get("value"), str):
+        raise ValueError("invalid payload record")
+    if kind == "message" and not expected_digest:
+        raise ValueError("missing payload digest")
+    if expected_digest and hashlib.sha256(data["value"].encode()).hexdigest() != expected_digest:
+        raise ValueError("payload reference metadata mismatch")
+    return data["value"]
 
 
 def _expire_if_stale(root: Path | str, path: Path, ttl: float, now: float) -> bool:
@@ -367,6 +414,7 @@ def claim_pending_envelopes(root: Path | str) -> list[dict]:
             envelope = json.loads(claimed.read_text(encoding="utf-8"))
             if not isinstance(envelope, dict):
                 raise ValueError(f"expected a JSON object, got {type(envelope).__name__}")
+            envelope["message"] = resolve_payload(root, envelope["id"], expected_digest=envelope.get("payload_digest"))
             out.append(envelope)
     return out
 
@@ -415,6 +463,7 @@ def _reoffer_unanswered(root: Path | str, base: Path, ttl: float, now: float) ->
                 continue
             envelope["reoffered_at"] = int(now)
             _atomic_write_json(path, envelope)
+            envelope["message"] = resolve_payload(root, envelope["id"], expected_digest=envelope.get("payload_digest"))
             out.append(envelope)
     return out
 
@@ -442,7 +491,20 @@ def write_reply(root: Path | str, envelope_id: str, *, reply: str = "", error: s
         from tools.bot_failure_reasons import classify_agent_error
 
         code = classify_agent_error(err)
-    _atomic_write_json(path, {"id": safe, "at": int(time.time()), "reply": str(reply or ""), "error": err, "reason": code})
+    # Reply text is kept in the payload record; the status file is reference-only.
+    from tools.bot_thread_sync import mask_text
+    masked_reply = mask_text(str(reply or "")).text
+    masked_error = mask_text(str(err or "")).text
+    payload = {
+        "id": safe, "kind": "reply", "value": masked_reply, "error": masked_error,
+    }
+    _payload_write(root, f"{safe}.reply.json", payload)
+    payload_digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    _payload_write(root, f"{safe}.json", {"id": safe, "at": int(time.time()),
+                              "payload_kind": "reply", "payload_digest": payload_digest,
+                              # Reference only; readers derive the actual path from the validated id.
+                              "payload_ref": f"{PAYLOADS_DIR}/{safe}.reply.json",
+                              "reason": code, "status": "failed" if err else "settled"}, subdir=REPLIES_DIR)
     return path
 
 
@@ -460,7 +522,8 @@ def unlink_files_older_than(directory: Path, pattern: str, cutoff: float) -> int
 
 def _sweep_stale(base: Path, *, now: float | None = None) -> int:
     cutoff = (time.time() if now is None else now) - STALE_AFTER_SECONDS
-    return sum(unlink_files_older_than(base / sub, "*.json", cutoff) for sub in (CLAIMED_DIR, REPLIES_DIR, OUTBOX_DIR))
+    return sum(unlink_files_older_than(base / sub, "*.json", cutoff)
+               for sub in (CLAIMED_DIR, REPLIES_DIR, OUTBOX_DIR, PAYLOADS_DIR))
 
 
 def cleanup_bot_relay_artifacts(max_age_hours: float | None = None) -> int:

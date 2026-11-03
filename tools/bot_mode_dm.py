@@ -110,6 +110,10 @@ def message_agent_tool_schema() -> dict:
                             "'Message from …' prefix — it is added automatically."
                         ),
                     },
+                    "art": {"type": "string", "enum": ["gespraech", "arbeitsauftrag"],
+                            "description": "Default 'gespraech' (conversation, visible in both Telegram threads). "
+                                           "'arbeitsauftrag' is the separate Bot Chat work-task path."},
+                    "projection_requested": {"type": "boolean"},
                 },
                 "required": ["target", "message"],
             },
@@ -195,7 +199,8 @@ def _err(message: str, *, roster: list[str] | None = None, peers: list[str] | No
     return json.dumps(payload)
 
 
-def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None) -> str:
+def message_agent_tool(target: str = "", message: str = "", task_id: Optional[str] = None, agent: Any = None,
+                       art: str = "gespraech", projection_requested: bool = False) -> str:
     """Deliver ``message`` to ``target``'s Bot Chat. Returns a JSON ack/error.
     ``agent`` is the calling AIAgent — used for the Bot Chat gate and sender identity."""
     home = _agent_home(agent)
@@ -216,6 +221,23 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
         return _err(f"Bot Mode gate check failed: {exc}")
 
     root, me = _hermes_root(Path(home)), _self_profile_name(Path(home))
+    # Conversation (default) goes through the authenticated ThreadSync capability that the gateway
+    # attached to this agent. IDs, tenant, threads and parent chain are derived there, never taken
+    # from model arguments. Only an explicit work task uses the separate Bot Chat transport.
+    art = str(art or "gespraech").lower()
+    if art != "arbeitsauftrag":
+        capability = getattr(agent, "_thread_sync_capability", None)
+        if capability is None or not callable(getattr(capability, "send", None)):
+            return _err("adapter_unbelegt: conversational message_agent requires an authenticated ThreadSync")
+        try:
+            result = capability.send(target=str(target), message=str(message), art="gespraech",
+                                     projection_requested=bool(projection_requested), transport="message_agent")
+            return json.dumps({"status": result.status, "reason": result.reason,
+                               "message_id": result.message_id, "attempts": result.attempts})
+        except Exception as exc:
+            logger.debug("authenticated thread capability failed closed", exc_info=True)
+            return _err(f"thread sync failed closed: {exc}")
+
     roster_homes = dict(_roster(root))
     roster = list(roster_homes)
     peers = _peers(root)
@@ -375,6 +397,8 @@ def _unlink_dm_file(path: str) -> None:
 def _write_dm_file(content: str) -> str:
     """The message rides a temp file — never inline shell text."""
     cleanup_bot_dm_cache()
+    from tools.bot_thread_sync import mask_text
+    content = mask_text(content).text
     fd, path = tempfile.mkstemp(prefix="dm-", suffix=".txt", dir=_dm_dir(), text=True)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -482,7 +506,9 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
         owner = find_canonical_live_owner(profile_home)
         if owner is None:
             return None
-        intent = dict(owner=owner, message=Path(dm_file).read_text(encoding="utf-8"),
+        # Reference + digest only: the text exists solely in the masked dm file.
+        intent = dict(owner=owner, payload_ref=Path(dm_file).name,
+                      payload_digest=hashlib.sha256(Path(dm_file).read_bytes()).hexdigest(),
                       delivery_id=_dm_delivery_id(dm_file),
                       **({"author": author} if author else {}))
         try:
@@ -498,7 +524,10 @@ def _admit_live_dm(profile_home: Path | None, dm_file: str, author: Optional[dic
     home = intent["owner"]["profile_home"]
     record = read_delivery_result(home, intent["delivery_id"])
     if record is None:
-        record = deliver_to_live_owner(home, intent["owner"], intent["message"],
+        body = Path(dm_file).read_bytes()
+        if hashlib.sha256(body).hexdigest() != intent.get("payload_digest"):
+            raise ValueError("payload reference metadata mismatch")
+        record = deliver_to_live_owner(home, intent["owner"], body.decode("utf-8"),
                                        delivery_id=intent["delivery_id"], author=intent.get("author"))
     return record
 
@@ -508,18 +537,18 @@ def _wait_live_dm(home: str, delivery_id: str, *, dm_file: "str | os.PathLike | 
 
     record = await_delivery(home, delivery_id, _LIVE_WAIT_SECONDS)
     status = record["status"] if record else "ambiguous"
+    final_status = status
     payload = {key: record[key] for key in ("reply", "error", "reason") if record and record.get(key)}
     payload.update(status=status, delivery_id=delivery_id)
     if status in ("queued", "claimed", "ambiguous"):
         payload["detail"] = "Delivery remains pending or its outcome is unknown. Do not resend; receipt is retained."
     elif status == "settled" and dm_file is not None:
-        # The intent carries the message plaintext so a retry can replay the SAME delivery id;
-        # once the owner settled it nothing retries, so it goes along with the dm file (same
-        # plaintext) — the live branch returns before _run_delivery's own unlink.
+        # Work-task path stays separate from conversation mirroring. The intent holds no text, and
+        # the dm file is the only plaintext carrier; both go once the owner settled it.
         _unlink_dm_file(str(dm_file) + ".live.json")
         _unlink_dm_file(str(dm_file))
     print(json.dumps(payload))
-    return 0 if status in ("settled", "queued", "claimed") else 1
+    return 0 if final_status in ("settled", "queued", "claimed", "mirrored") else 1
 
 
 def _local_delivery_home(argv: list[str]) -> Path | None:
@@ -792,6 +821,18 @@ def _wait_reply_main(reply_path: str, label: str, budget_seconds: str) -> int:
         if os.path.exists(reply_path):
             with open(reply_path, encoding="utf-8") as fh:
                 d = json.load(fh)
+            envelope_id = Path(reply_path).stem
+            if not re.fullmatch(r"[0-9a-f]{32}", envelope_id) or d.get("id") != envelope_id:
+                return 2
+            payload_path = Path(reply_path).parent.parent / "payloads" / f"{envelope_id}.reply.json"
+            if payload_path.is_symlink() or not payload_path.is_file():
+                return 2
+            with open(payload_path, encoding="utf-8") as fh:
+                payload = json.load(fh)
+            digest = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            if d.get("payload_kind") != "reply" or d.get("payload_digest") != digest or payload.get("id") != envelope_id:
+                return 2
+            d = {**d, "reply": payload.get("value", ""), "error": payload.get("error", "")}
             if d.get("error"):
                 # Typed reason code rides ahead of the free text so the sender can branch on it
                 # without parsing provider prose. See #93091.

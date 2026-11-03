@@ -42,7 +42,7 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
 
     port = _free_port()
     monkeypatch.setenv("A2A_PORT", str(port))
-    adapter = A2AAdapter(PlatformConfig(enabled=True))
+    adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": port}))
 
     async def fake_handle_message(event):
         reply = "ECHO: " + event.text if reply_fn is None else reply_fn(event)
@@ -485,7 +485,7 @@ class TestTaskStore:
 
         monkeypatch.setattr(adapter, "_forward_to_profile", fake_forward)
         terminal, pending = adapter._prepare_task(
-            {"message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="forwarded")},
+            {"art": "arbeitsauftrag", "message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="forwarded")},
             "peer", agent=agent,
         )
 
@@ -614,6 +614,9 @@ class TestDynamicAgentCards:
         from gateway.config import PlatformConfig
         from plugins.platforms.a2a.adapter import A2AAdapter
 
+        # The developer shell may restrict cards globally; this test exercises the
+        # unconfigured registry path and must be independent of that environment.
+        monkeypatch.delenv("A2A_ADVERTISED_TOOLSETS", raising=False)
         monkeypatch.setattr(registry, "get_registered_toolset_names",
                             lambda: ["webz", "termz"])
         monkeypatch.setattr(registry, "get_tool_names_for_toolset",

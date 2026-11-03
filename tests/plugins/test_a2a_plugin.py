@@ -17,6 +17,7 @@ import re
 import os
 import socket
 import threading
+import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -439,7 +440,7 @@ class TestClientTools:
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        out = tools.a2a_call({"agent": "r", "message": "my key sk-abcdefghij1234567890ABCD please"})
+        out = tools.a2a_call({"agent": "r", "art": "arbeitsauftrag", "message": "my key sk-abcdefghij1234567890ABCD please"})
         assert "here is the answer" in out
 
         params = captured["body"]["params"]
@@ -459,16 +460,16 @@ class TestClientTools:
         monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
 
         def fake_post(url, body, headers, timeout):
+            ctx = body["params"]["message"]["contextId"]
             return protocol.jsonrpc_result(
-                body["id"],
-                protocol.build_task("t", "ctx-q", protocol.STATE_INPUT_REQUIRED, "Which repo?"),
+                body["id"], protocol.build_task("t", ctx, protocol.STATE_INPUT_REQUIRED, "Which repo?"),
             )
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        out = tools.a2a_call({"agent": "r", "message": "review the code"})
+        out = tools.a2a_call({"agent": "r", "art": "arbeitsauftrag", "message": "review the code"})
         assert "Which repo?" in out
         assert "input-required" in out
-        assert "ctx-q" in out
+        assert "ctx-" in out
 
     def test_rpc_url_prefers_supported_interfaces(self):
         card = {
@@ -521,12 +522,13 @@ class TestRegistryDispatchConvention:
 
         def fake_post(url, body, headers, timeout):
             captured["sent"] = True
+            ctx = body["params"]["message"]["contextId"]
             return protocol.jsonrpc_result(
                 body["id"],
-                protocol.build_task("t", "c1", protocol.STATE_COMPLETED, "PONG"))
+                protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "PONG"))
 
         monkeypatch.setattr(tools, "_http_post_json", fake_post)
-        out = tools.a2a_call({"agent_name": "peer", "message": "ping"})
+        out = tools.a2a_call({"agent_name": "peer", "art": "arbeitsauftrag", "message": "ping"})
         assert captured.get("sent") is True
         assert "PONG" in out
 
@@ -539,6 +541,22 @@ def _bare_adapter():
     from plugins.platforms.a2a.adapter import A2AAdapter
     from gateway.config import PlatformConfig
     return A2AAdapter(PlatformConfig(enabled=True))
+
+
+def test_reconnect_clears_shutdown_lifecycle_state():
+    from plugins.platforms.a2a.adapter import A2AAdapter
+    from gateway.config import PlatformConfig
+
+    async def run():
+        adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": 0}))
+        assert await adapter.connect()
+        await adapter.disconnect()
+        assert adapter._shutting_down is True
+        assert await adapter.connect()
+        assert adapter._shutting_down is False
+        await adapter.disconnect()
+
+    asyncio.run(run())
 
 
 class TestReplyCapture:
@@ -1331,7 +1349,7 @@ class TestMultiAgentRouting:
 
         adapter._forward_to_profile = fake_forward  # type: ignore
         terminal, pending = adapter._prepare_task(
-            {"tenant": "dev", "message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")},
+            {"art": "arbeitsauftrag", "tenant": "dev", "message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="ctx-dev")},
             "peer-x",
             agent=agent,
         )
@@ -1395,7 +1413,7 @@ class TestV1SpecRegressionFixes:
 
         async def run():
             assert await adapter.connect() is True
-            body = _send_body("hello v1")
+            body = _send_body("hello v1", extra_params={"art": "arbeitsauftrag"})
             body["method"] = "SendMessage"
             resp = await asyncio.to_thread(_post_json, base + "/", body, {"A2A-Version": "1.0"})
             assert resp["id"] == "1"
@@ -1691,3 +1709,532 @@ def test_load_conversation_skips_non_dict_lines(monkeypatch, tmp_path):
         f.write("42\n")
     convo = protocol.load_conversation("ctx-mixed")
     assert len(convo) == 1 and convo[0]["text"] == "hello"
+
+
+class TestConversationalAdmissionAndTransport:
+    """A2A conversation = complete masked ThreadEnvelope, authenticated before any side effect."""
+
+    @staticmethod
+    def _adapter():
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.config import PlatformConfig
+        return A2AAdapter(PlatformConfig(enabled=True, extra={"port": _free_port()}))
+
+    @staticmethod
+    def _params(text="hello"):
+        from tests.tools.bot_thread_support import envelope
+        from tools.bot_thread_sync import mask_text
+        m = mask_text(text)
+        env = envelope(text=m.text, masking=m.proof(), tenant="tenant-1", tenant_source="x")
+        return {"message": protocol.text_message(protocol.ROLE_USER, m.text, context_id=env.conversation_id),
+                "thread_contract": env.to_wire()}
+
+    def _spy(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(security, "audit", lambda *a, **k: calls.append("audit"))
+        monkeypatch.setattr(protocol, "persist_message", lambda *a, **k: calls.append("persist"))
+        return calls
+
+    def test_missing_capability_fails_closed_with_zero_side_effects(self, monkeypatch):
+        adapter, calls = self._adapter(), self._spy(monkeypatch)
+        terminal, pending = adapter._prepare_task(self._params(), "peer")
+        assert pending is None and terminal["status"]["state"] == protocol.STATE_FAILED
+        assert calls == [] and not adapter.tasks._tasks
+
+    def test_missing_art_defaults_to_conversation_and_requires_contract(self, monkeypatch):
+        adapter, calls = self._adapter(), self._spy(monkeypatch)
+        adapter.set_gateway_context_factory(lambda: SimpleNamespace(
+            receive_wire=lambda w, peer=None, external_dispatch=False: pytest.fail("received"), attest=lambda *n: True))
+        params = self._params()
+        del params["thread_contract"]  # no complete envelope
+        terminal, _ = adapter._prepare_task(params, "peer")
+        assert terminal["status"]["state"] == protocol.STATE_FAILED and calls == []
+
+    def test_blocked_admission_has_no_task_audit_or_persistence(self, monkeypatch):
+        adapter, calls = self._adapter(), self._spy(monkeypatch)
+        seen = {}
+        cap = SimpleNamespace(attest=lambda *n: seen.setdefault("attest", n),
+                              receive_wire=lambda w, peer=None, external_dispatch=False: seen.setdefault("wire", w) and seen.setdefault("peer", peer) and
+                              SimpleNamespace(status="blocked", reason="maskierung_unbelegt"))
+        adapter.set_gateway_context_factory(lambda: cap)
+        params = self._params()
+        terminal, _ = adapter._prepare_task(params, "peer")
+        assert seen["wire"] == params["thread_contract"] and seen["attest"] == ("a2a_admission",)
+        assert seen["peer"] == "peer"  # the authenticated peer identity travels to sender binding
+        assert terminal["status"]["state"] == protocol.STATE_FAILED and calls == [] and not adapter.tasks._tasks
+
+    def test_conversational_reply_goes_through_receiver_threadsync_masking(self, monkeypatch):
+        adapter, _ = self._adapter(), self._spy(monkeypatch)
+        calls = []
+
+        def send_reply(wire, text):
+            calls.append((wire, text))
+            from tests.tools.bot_thread_support import envelope
+            return SimpleNamespace(status="sent", reason=""), envelope(text="MASKED-BY-RECEIVER", message_id="r1",
+                                                                      parent_message_id="msg-1", is_root=False)
+
+        adapter.set_gateway_context_factory(lambda: SimpleNamespace(send_reply=send_reply))
+        adapter._thread_inbound["t1"] = {"message_id": "msg-1"}
+        adapter._add_pending = adapter._add_pending  # real pending bookkeeping
+        pending = {"task_id": "t1", "context_id": "c", "peer": "p", "started": time.time()}
+        monkeypatch.setattr(adapter, "_record_outcome", lambda *a, **k: None)
+        state, reply = adapter._finalize_task(pending, protocol.STATE_COMPLETED, "RECEIVER_ONLY_SECRET_77")
+        assert reply == "MASKED-BY-RECEIVER" and state == protocol.STATE_COMPLETED
+        assert calls == [({"message_id": "msg-1"}, "RECEIVER_ONLY_SECRET_77")]
+        assert adapter._thread_replies["t1"]["parent_message_id"] == "msg-1"
+
+    def test_conversational_reply_is_withheld_when_masking_cannot_be_proven(self, monkeypatch):
+        adapter = self._adapter()
+        adapter.set_gateway_context_factory(lambda: None)  # no authenticated capability
+        adapter._thread_inbound["t2"] = {"message_id": "msg-1"}
+        monkeypatch.setattr(adapter, "_record_outcome", lambda *a, **k: None)
+        state, reply = adapter._finalize_task({"task_id": "t2", "context_id": "c", "peer": "p", "started": time.time()},
+                                              protocol.STATE_COMPLETED, "RECEIVER_ONLY_SECRET_77")
+        assert state == protocol.STATE_FAILED and "RECEIVER_ONLY_SECRET_77" not in reply
+
+    # ---- admission != processed: processed only after the GATEWAY explicitly accepted the event ----
+    def _live(self, monkeypatch, tmp_path, mode="accept"):
+        """Real ThreadSync behind the capability seam. The dispatcher really executes handle_message;
+        only Telegram egress and the downstream model loop are stubbed."""
+        import concurrent.futures
+        from tests.tools.bot_thread_support import make_ctx, make_sync
+        w = SimpleNamespace(mode=mode, dispatched=0, projections=[], t=[time.time()], fail_acks=0, die_on_accept=False, gateway_calls=0, keys=[], events=[])
+        ctx = make_ctx(tmp_path / "b", profile="linus", thread="linus-t", live="live-b")
+
+        def new_sync():
+            return make_sync(tmp_path, ctx, name="b", clock=lambda: w.t[0],
+                             project=lambda o, p: w.projections.append(p["message_id"]) or "r")
+
+        w.sync = new_sync()
+        w.restart = lambda: setattr(w, "sync", new_sync())
+
+        class Cap:
+            attest = staticmethod(lambda *n: w.sync.attest(*n))
+
+            def receive_wire(self, wire, peer=None, external_dispatch=False):
+                from tools.bot_thread_sync import ThreadEnvelope
+                return w.sync.receive(ThreadEnvelope.from_wire(wire), external_dispatch=external_dispatch)
+
+            dispatch_started = staticmethod(lambda t: w.sync.dispatch_started(t))
+            dispatch_begin = staticmethod(lambda t: w.sync.dispatch_begin(t))
+            @staticmethod
+            def dispatch_accepted(t):
+                if w.die_on_accept:
+                    raise KeyboardInterrupt()  # process dies after the gateway took it, before the record
+                return w.sync.accept_dispatch(t)
+
+            dispatch_release = staticmethod(lambda t: w.sync.release_dispatch(t))
+            abort_dispatch = staticmethod(lambda t: w.sync.abort_dispatch(t))
+
+            @staticmethod
+            def dispatch_finish(t, outcome="completed", reply_expected=True):
+                if w.fail_acks:  # injected transient failure of the terminal write
+                    w.fail_acks -= 1
+                    w.sync.complete_model(t)  # model finished + reply durable; the terminal record is not
+                    w.sync.mark_reply_stored(t, no_reply=True)
+                    return False
+                return w.sync.finish_dispatch(t, outcome, reply_expected)
+
+        adapter = self._adapter()
+        adapter.set_gateway_context_factory(lambda: Cap())
+        self._spy(monkeypatch)
+
+        async def handle_message(event):  # mirrors BasePlatformAdapter: set acceptance, return quickly
+            w.gateway_calls += 1
+            w.keys.append((event.metadata or {}).get("thread_dispatch_key"))
+            w.events.append(event)
+            if w.mode == "raise":
+                raise RuntimeError("gateway exploded")
+            if w.mode == "die_in_gateway":
+                raise KeyboardInterrupt()  # dies after the durable RUNNING claim, before the model
+            if w.mode == "slow":
+                event._gateway_accepted = True
+                w.dispatched += 1
+                await asyncio.sleep(0.4)
+                return
+            event._gateway_accepted = w.mode == "accept"
+            w.dispatched += w.mode == "accept"
+
+        adapter.handle_message = handle_message
+
+        def submit(coro, loop):
+            fut = concurrent.futures.Future()
+            if w.mode == "hang":
+                coro.close()
+                w.hung = fut
+                return fut  # the gateway never answers
+            if w.mode == "slow":
+                import threading
+                w.thread = threading.Thread(target=lambda: asyncio.run(coro), daemon=True)
+                w.thread.start()
+                return fut  # never answers within the bounded wait
+            if w.mode == "crash":
+                coro.close()
+                raise KeyboardInterrupt()
+            try:
+                fut.set_result(asyncio.run(coro))
+            except Exception as exc:
+                fut.set_exception(exc)
+            return fut
+
+        monkeypatch.setattr("plugins.platforms.a2a.adapter.asyncio.run_coroutine_threadsafe", submit)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._GATEWAY_ACCEPT_TIMEOUT", 0.05)
+        monkeypatch.setattr("plugins.platforms.a2a.adapter._reply_timeout", lambda: 0.05)  # recovered consumers end fast
+        w.adapter = adapter
+        adapter._loop, adapter._message_handler = object(), object()
+
+        def complete(outcome="completed"):  # what the gateway does after `_process_message_background` ran
+            return asyncio.run(w.events[-1].on_complete(outcome))
+
+        w.complete = complete
+        return w
+
+    @staticmethod
+    def _processed(w):
+        return [e for e in w.sync.journal.events("conv-1") if e["kind"] == "inbound_processed"]
+
+    def test_not_ready_then_retry_resumes_dispatch_without_second_projection(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        w.adapter._loop = None  # gateway not ready
+        params = self._params()
+        first, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and first["status"]["state"] == protocol.STATE_FAILED
+        assert not self._processed(w)
+        w.adapter._loop = object()
+        retry, pending = w.adapter._prepare_task(params, "peer")
+        assert retry is None and pending is not None and w.dispatched == 1  # resumed, NOT duplicate_nachricht
+        assert w.projections == ["msg-1"] and not self._processed(w)  # SCHEDULED, not completed
+        w.complete()  # the gateway's completion callback after the model really ran
+        assert len(self._processed(w)) == 1
+
+    def test_gateway_scheduling_is_not_completion_only_the_completion_callback_terminalizes(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        params = self._params()
+        _, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 1 and not self._processed(w)  # SCHEDULED only
+        assert w.sync.journal.dispatch_state("conv-1", "msg-1") == "ACCEPTED"
+        early, _ = w.adapter._prepare_task(params, "peer")  # sender retry while the model is in flight
+        assert "in_bearbeitung" in json.dumps(early) and w.dispatched == 1
+        w.complete("cancelled")  # an interrupted run must stay recoverable
+        assert not self._processed(w)
+        w.complete("completed")
+        assert len(self._processed(w)) == 1
+        replay, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and replay["status"]["state"] == protocol.STATE_REJECTED
+        assert "duplicate" in json.dumps(replay) and w.dispatched == 1 and w.projections == ["msg-1"]
+
+    @pytest.mark.parametrize("mode", ["reject", "raise", "hang"])
+    def test_gateway_rejection_error_or_timeout_stays_retryable(self, monkeypatch, tmp_path, mode):
+        w = self._live(monkeypatch, tmp_path, mode=mode)
+        params = self._params()
+        failed, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and failed["status"]["state"] == protocol.STATE_FAILED
+        assert not self._processed(w) and w.dispatched == 0  # NOT deduplicated
+        if mode == "hang":
+            assert w.hung.cancelled()  # the unanswered submission is withdrawn
+        w.mode = "accept"
+        retry, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 1 and w.projections == ["msg-1"]  # one projection overall
+        w.complete()
+        assert len(self._processed(w)) == 1
+
+    def test_failed_terminal_write_after_model_completion_finalizes_on_replay_without_redispatch(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        params = self._params()
+        w.fail_acks = 1
+        _, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 1
+        w.complete()  # model finished; the terminal write fails transiently
+        assert not self._processed(w) and w.sync.journal.dispatch_state("conv-1", "msg-1") == "REPLIED"
+        w.restart()  # capability reconstruction
+        replay, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and replay["status"]["state"] == protocol.STATE_REJECTED
+        assert w.dispatched == 1 and len(self._processed(w)) == 1 and w.projections == ["msg-1"]
+
+    def test_lost_completion_callback_redrives_the_model_only_after_the_completion_lease(self, monkeypatch, tmp_path):
+        import tools.bot_thread_sync as sync_mod
+        monkeypatch.setattr(sync_mod, "COMPLETION_LEASE_SECONDS", 200)
+        w = self._live(monkeypatch, tmp_path)
+        params = self._params()
+        w.adapter._prepare_task(params, "peer")  # SCHEDULED; the process then dies before completion fires
+        w.restart()
+        busy, _ = w.adapter._prepare_task(params, "peer")
+        assert "in_bearbeitung" in json.dumps(busy) and w.dispatched == 1 and not self._processed(w)
+        w.t[0] += 201  # completion lease expired: at-least-once re-drive under the same key
+        retry, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 2 and len(set(w.keys)) == 1
+        w.complete()
+        assert len(self._processed(w)) == 1 and w.projections == ["msg-1"]
+
+    def test_recovered_conversational_message_is_dispatched_through_the_gateway_with_acceptance(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        from tools.bot_thread_sync import ThreadEnvelope
+        env = ThreadEnvelope.from_wire(self._params()["thread_contract"])
+        assert w.adapter.dispatch_thread_message(env) is True and w.dispatched == 1
+        w.mode = "reject"
+        assert w.adapter.dispatch_thread_message(env) is False and w.dispatched == 1
+        w.adapter._loop = None
+        assert w.adapter.dispatch_thread_message(env) is False
+        w.adapter._completion_pool.shutdown(wait=True)
+
+    def test_crash_between_intent_and_submission_is_retryable_after_lease(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a import adapter as adapter_mod
+        w = self._live(monkeypatch, tmp_path, mode="crash")
+        monkeypatch.setattr(adapter_mod._Dispatch, "abort", lambda self: None)  # dead process runs no cleanup
+        params = self._params()
+        with pytest.raises(KeyboardInterrupt):
+            w.adapter._prepare_task(params, "peer")
+        assert w.sync.journal.dispatch_state("conv-1", "msg-1") == "PENDING"  # durably enqueued, never claimed
+        assert not self._processed(w) and w.dispatched == 0
+        w.restart()
+        w.mode = "accept"
+        busy, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and "in_bearbeitung" in json.dumps(busy)  # lease still live: no double dispatch
+        w.t[0] += 121
+        retry, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 1 and w.projections == ["msg-1"]
+        w.complete()
+        assert len(self._processed(w)) == 1
+
+    def test_failed_model_run_does_not_terminalize_and_is_redriven_after_the_lease(self, monkeypatch, tmp_path):
+        import tools.bot_thread_sync as sync_mod
+        monkeypatch.setattr(sync_mod, "COMPLETION_LEASE_SECONDS", 200)
+        w = self._live(monkeypatch, tmp_path)
+        params = self._params()
+        w.adapter._prepare_task(params, "peer")
+        w.complete("failed")  # the gateway reports the handler raised
+        assert not self._processed(w) and w.sync.journal.dispatch_state("conv-1", "msg-1") == "ACCEPTED"
+        replay, _ = w.adapter._prepare_task(params, "peer")
+        assert "duplicate" not in json.dumps(replay)  # NOT deduplicated: no genuine completion happened
+        w.t[0] += 201
+        _, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 2  # the handler runs again
+        w.complete("completed")
+        assert len(self._processed(w)) == 1
+
+    def _records(self, w, kind):
+        return [e for e in w.sync.journal.events("conv-1") if e["kind"] == kind]
+
+    # Crash contract: model execution is AT-LEAST-ONCE after an ambiguous crash, always under the same
+    # stable dispatch key; visible projections and the durable terminal record are AT-MOST-ONCE.
+    def _keys(self, w):
+        return w.keys
+
+    def test_crash_after_gateway_claim_before_model_is_resubmitted_with_the_same_key(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a import adapter as adapter_mod
+        w = self._live(monkeypatch, tmp_path, mode="die_in_gateway")
+        monkeypatch.setattr(adapter_mod._Dispatch, "abort", lambda self: None)  # dead process, no cleanup
+        params = self._params()
+        with pytest.raises(KeyboardInterrupt):
+            w.adapter._prepare_task(params, "peer")
+        assert w.sync.journal.dispatch_state("conv-1", "msg-1") == "RUNNING" and w.dispatched == 0
+        w.restart()
+        w.mode = "accept"
+        busy, _ = w.adapter._prepare_task(params, "peer")
+        assert "in_bearbeitung" in json.dumps(busy) and w.dispatched == 0  # lease still live
+        w.t[0] += 121  # lease expiry + capability reconstruction
+        replay, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.dispatched == 1  # EVENTUAL model processing, never lost
+        assert len(self._records(w, "dispatch_running")) == 2 and len(set(w.keys)) == 1  # same stable key
+        w.complete()
+        assert len(self._processed(w)) == 1 and w.projections == ["msg-1"]
+
+    def test_crash_after_model_acceptance_before_record_may_rerun_model_but_never_duplicates_outputs(self, monkeypatch, tmp_path):
+        from plugins.platforms.a2a import adapter as adapter_mod
+        w = self._live(monkeypatch, tmp_path)
+        monkeypatch.setattr(adapter_mod._Dispatch, "abort", lambda self: None)
+        w.die_on_accept = True
+        params = self._params()
+        with pytest.raises(KeyboardInterrupt):
+            w.adapter._prepare_task(params, "peer")
+        assert w.dispatched == 1 and not self._processed(w)  # the model DID start; the record never said so
+        w.die_on_accept = False
+        w.restart()
+        assert "in_bearbeitung" in json.dumps(w.adapter._prepare_task(params, "peer")[0])
+        w.t[0] += 121
+        replay, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None
+        assert w.dispatched == 2 and len(set(w.keys)) == 1  # at-least-once model, SAME idempotency key
+        w.complete()
+        assert len(self._processed(w)) == 1 and w.projections == ["msg-1"]  # at-most-once outputs
+        again, _ = w.adapter._prepare_task(params, "peer")
+        assert again["status"]["state"] == protocol.STATE_REJECTED and w.dispatched == 2  # now durably terminal
+
+    def test_gateway_timeout_after_claim_is_resubmitted_only_after_the_lease(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path, mode="slow")
+        params = self._params()
+        failed, pending = w.adapter._prepare_task(params, "peer")
+        w.thread.join(5)
+        assert pending is None and failed["status"]["state"] == protocol.STATE_FAILED
+        assert w.sync.journal.dispatch_state("conv-1", "msg-1") == "RUNNING"
+        early, _ = w.adapter._prepare_task(params, "peer")
+        assert "in_bearbeitung" in json.dumps(early) and w.gateway_calls == 1 and not self._processed(w)
+        w.mode = "accept"
+        w.t[0] += 121
+        late, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is not None and w.gateway_calls == 2 and len(set(w.keys)) == 1
+        w.complete()
+        assert len(self._processed(w)) == 1
+
+    def test_admission_receipt_accompanies_every_durable_outcome(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        params = self._params()
+        digest = params["thread_contract"]["envelope_digest"]
+        _, pending = w.adapter._prepare_task(params, "peer")
+        assert pending["admission"] == {"message_id": "msg-1", "envelope_digest": digest, "status": "admitted"}
+        w.complete()
+        replay, _ = w.adapter._prepare_task(params, "peer")
+        assert replay["metadata"]["thread_admission"]["status"] == "duplicate"
+        bad = self._params()
+        bad["thread_contract"] = {**bad["thread_contract"], "text": "x"}
+        refused, _ = w.adapter._prepare_task(bad, "peer")
+        assert "thread_admission" not in refused.get("metadata", {})  # not admitted → no receipt
+
+    def test_gateway_unavailable_is_durably_queued_then_dispatched_once_on_gateway_restart(self, monkeypatch, tmp_path):
+        w = self._live(monkeypatch, tmp_path)
+        w.adapter._loop = None  # gateway down
+        params = self._params()
+        failed, pending = w.adapter._prepare_task(params, "peer")
+        assert pending is None and failed["metadata"]["thread_admission"]["status"] == "queued"
+        rows = [e for e in w.sync.journal.events("conv-1") if e["kind"] == "queue"]
+        assert rows and rows[-1]["dispatch"] == "external" and w.sync.journal.dispatch_state("conv-1", "msg-1") == "PENDING"
+        assert w.dispatched == 0
+        w.restart()  # gateway restarts with a fresh capability + the adapter as its dispatcher
+        w.adapter._loop = object()
+        w.sync.dispatcher = w.adapter.dispatch_thread_message
+        result = w.sync.retry_due(now=w.t[0] + 10)[0]
+        assert (result.status, result.reason) == ("queued", "modell_geplant") and w.dispatched == 1
+        assert not self._processed(w)  # scheduled, the model has not completed yet
+        w.complete()  # gateway completion callback
+        assert len(self._processed(w)) == 1
+        assert w.sync.retry_due(now=w.t[0] + 20) == []
+        replay, _ = w.adapter._prepare_task(params, "peer")  # sender retry
+        assert replay["metadata"]["thread_admission"]["status"] == "duplicate"
+        assert w.dispatched == 1 and w.projections == ["msg-1"]
+
+    def test_replayed_envelope_terminates_before_task_creation(self, monkeypatch):
+        adapter, calls = self._adapter(), self._spy(monkeypatch)
+        adapter.set_gateway_context_factory(lambda: SimpleNamespace(
+            attest=lambda *n: True, receive_wire=lambda w, peer=None, external_dispatch=False: SimpleNamespace(status="duplicate", reason="bereits_verarbeitet")))
+        dispatched = []
+        monkeypatch.setattr(adapter, "_forward_to_profile", lambda *a, **k: dispatched.append(1), raising=False)
+        terminal, pending = adapter._prepare_task(self._params(), "peer")
+        assert pending is None and terminal["status"]["state"] == protocol.STATE_REJECTED
+        assert "duplicate" in json.dumps(terminal) and calls == [] and not adapter.tasks._tasks and not dispatched
+
+    def _outbound(self, monkeypatch, *, metadata, receiver_result=("received", None)):
+        from dataclasses import asdict
+        from tests.tools.bot_thread_support import envelope
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"r": {
+            "url": "http://localhost:9999", "telegram_thread": {"platform": "telegram", "chat_id": "max", "thread_id": "linus-t"}}}})
+        monkeypatch.setattr(tools, "_http_get_json", lambda url, h, t: None)
+        captured = {}
+
+        def fake_post(url, body, headers, timeout):
+            captured["params"] = body["params"]
+            ctx = body["params"]["message"]["contextId"]
+            wire = body["params"]["thread_contract"]
+            receipt = {"message_id": wire["message_id"], "envelope_digest": wire["envelope_digest"], "status": "admitted"}
+            task = protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "PONG",
+                                       metadata={**(metadata or {}), "thread_admission": receipt})
+            return protocol.jsonrpc_result(body["id"], task)
+
+        monkeypatch.setattr(tools, "_http_post_json", fake_post)
+        seen = {}
+
+        class Cap:
+            def send(self, *, wire_transport, **kw):
+                wire_transport(asdict(envelope(text="masked hi", transport="a2a")))
+                return SimpleNamespace(status="sent", reason="")
+
+            def receive_reply(self, contract, *, original, text):
+                seen["args"] = (contract, original.message_id, text)
+                status, clean = receiver_result
+                return SimpleNamespace(status=status, reason="" if clean else "maskierung_unbelegt"), clean
+
+        out = tools.a2a_call({"agent": "r", "message": "hi"}, agent=SimpleNamespace(_thread_sync_capability=Cap()))
+        return out, captured, seen
+
+    def test_outbound_conversation_sends_complete_envelope_and_exposes_only_authenticated_reply(self, monkeypatch):
+        from tools.bot_thread_sync import ThreadEnvelope
+        contract = {"marker": "reply-envelope"}
+        out, captured, seen = self._outbound(monkeypatch, metadata={"thread_contract": contract},
+                                             receiver_result=("received", "PONG"))
+        assert "PONG" in out
+        assert ThreadEnvelope.from_wire(captured["params"]["thread_contract"]).message_id == "msg-1"
+        assert captured["params"]["art"] == "gespraech"
+        assert seen["args"] == (contract, "msg-1", "PONG")  # sender-side ThreadSync judged the reply
+
+    def test_reply_without_thread_contract_is_withheld_even_if_generic_masking_would_pass(self, monkeypatch):
+        out, _, seen = self._outbound(monkeypatch, metadata=None)
+        assert "PONG" not in out and "reply withheld" in out and "args" not in seen
+
+    def test_reply_rejected_by_sender_side_rescan_is_withheld(self, monkeypatch):
+        out, _, _ = self._outbound(monkeypatch, metadata={"thread_contract": {"x": 1}}, receiver_result=("blocked", None))
+        assert "PONG" not in out and "maskierung_unbelegt" in out
+
+    def test_outbound_conversation_without_capability_is_refused(self, monkeypatch):
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"r": {"url": "http://localhost:9999"}}})
+        monkeypatch.setattr(tools, "_http_post_json", lambda *a: pytest.fail("sent"))
+        assert "adapter_unbelegt" in tools.a2a_call({"agent": "r", "message": "hi"})
+
+
+class TestArtSelectionThroughThePublicRegistry:
+    """`art` is part of the public a2a_call schema; missing art is a conversation (approved spec)."""
+
+    def _register(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tools, "_load_config", lambda: {"a2a_agents": {"r": {
+            "url": "http://x", "profile": "linus",
+            "telegram_thread": {"platform": "telegram", "chat_id": "max", "thread_id": "linus-t"}}}})
+        monkeypatch.setattr(tools, "_http_get_json", lambda *a: None)
+        from tools.registry import registry
+
+        class _Ctx:
+            def register_tool(self, name, toolset, schema, handler, **kw):
+                registry.register(name=name, toolset=toolset, schema=schema, handler=handler, override=True, **kw)
+
+        tools.register_tools(_Ctx())
+        return registry
+
+    def test_schema_exposes_the_art_enum(self, monkeypatch, tmp_path):
+        registry = self._register(monkeypatch, tmp_path)
+        props = registry.get_entry("a2a_call").schema["parameters"]["properties"]
+        assert props["art"]["enum"] == ["gespraech", "arbeitsauftrag"]
+
+    def test_arbeitsauftrag_uses_the_legacy_task_path_without_threadsync(self, monkeypatch, tmp_path):
+        registry = self._register(monkeypatch, tmp_path)
+        sent = {}
+
+        def post(url, body, headers, timeout):
+            sent["params"] = body["params"]
+            ctx = body["params"]["message"]["contextId"]
+            return protocol.jsonrpc_result(body["id"], protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "DONE"))
+
+        monkeypatch.setattr(tools, "_http_post_json", post)
+        out = registry.dispatch("a2a_call", {"agent": "r", "message": "do it", "art": "arbeitsauftrag"})
+        assert "DONE" in out  # no capability / Telegram thread needed
+        assert sent["params"]["art"] == "arbeitsauftrag" and "thread_contract" not in sent["params"]
+
+    def test_missing_art_defaults_to_conversation_and_requires_threadsync(self, monkeypatch, tmp_path):
+        registry = self._register(monkeypatch, tmp_path)
+        monkeypatch.setattr(tools, "_http_post_json", lambda *a: pytest.fail("must not send"))
+        assert "adapter_unbelegt" in registry.dispatch("a2a_call", {"agent": "r", "message": "hi"})
+        assert "adapter_unbelegt" in registry.dispatch("a2a_call", {"agent": "r", "message": "hi", "art": "gespraech"})
+
+    def test_conversation_with_capability_goes_through_threadsync_and_invalid_art_is_rejected(self, monkeypatch, tmp_path):
+        from dataclasses import asdict
+        from types import SimpleNamespace
+        from tests.tools.bot_thread_support import envelope
+        registry = self._register(monkeypatch, tmp_path)
+        seen = {}
+
+        class Cap:
+            def send(self, **kw):
+                seen.update(kw)
+                return SimpleNamespace(status="queued", reason="x")
+
+        out = registry.dispatch("a2a_call", {"agent": "r", "message": "hi"},
+                                agent=SimpleNamespace(_thread_sync_capability=Cap()))
+        assert seen["transport"] == "a2a" and "queued" in out
+        assert "must be" in registry.dispatch("a2a_call", {"agent": "r", "message": "hi", "art": "bogus"})

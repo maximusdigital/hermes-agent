@@ -257,6 +257,89 @@ class A2ARequestHandler(BaseHTTPRequestHandler):
             self._json(200, getattr(adapter, handler_name)(req_id, params, agent=agent))
 
 
+class _Lifecycle:
+    """A transport/lifecycle outcome of a pending reply (shutdown, cancel, processing failure signal).
+    It is NEVER model output: it must not become reply text, an envelope, a projection or a completion."""
+    __slots__ = ("state",)
+
+    def __init__(self, state: str):
+        self.state = state
+
+
+# Identity-compared waiter outcomes (a model can never produce these objects).
+_TIMEOUT_RESULT = (protocol.STATE_FAILED, "[agent did not reply in time]")
+_CLIENT_GONE = (protocol.STATE_FAILED, "[client disconnected]")
+
+_GATEWAY_ACCEPT_TIMEOUT = 15.0  # bounded wait for the gateway acceptance answer (< claim lease)
+
+
+class _Dispatch:
+    """Post-dispatch acknowledgement seam for one admitted conversational message (no-op otherwise)."""
+
+    def __init__(self, adapter: "A2AAdapter", ticket: Optional[dict]):
+        self._adapter, self._ticket = adapter, ticket
+
+    @property
+    def pending(self) -> bool:
+        return self._ticket is not None
+
+    @property
+    def ticket(self) -> Optional[dict]:
+        return self._ticket
+
+    def _capability(self):
+        return self._adapter.gateway_context()
+
+    def started(self) -> bool:
+        if self._ticket is None:
+            return True
+        cap = self._capability()
+        return bool(cap is not None and cap.dispatch_started(self._ticket))
+
+    def accepted(self) -> bool:
+        """Durable receipt that the gateway took the message (key for idempotent finalize)."""
+        if self._ticket is None:
+            return True
+        cap = self._capability()
+        try:
+            return bool(cap is not None and cap.dispatch_accepted(self._ticket))
+        except Exception:
+            logger.warning("A2A dispatch receipt failed", exc_info=True)
+            return False
+
+    def ack(self) -> bool:
+        """Finalize durably FIRST; the in-memory ticket is cleared only once that succeeded."""
+        if self._ticket is None:
+            return True
+        cap = self._capability()
+        try:
+            done = bool(cap is not None and cap.ack_dispatch(self._ticket))
+        except Exception:
+            logger.warning("A2A dispatch acknowledgement failed", exc_info=True)
+            done = False
+        if done:
+            self._ticket = None
+        return done
+
+    def scheduled(self) -> None:
+        """The gateway SCHEDULED the message (durable ACCEPTED). The terminal record is NOT written here:
+        the gateway's completion callback does that after the model really ran. Just free our claim."""
+        ticket, self._ticket = self._ticket, None
+        cap = self._capability() if ticket else None
+        if cap is not None:
+            with contextlib.suppress(Exception):
+                cap.abort_dispatch(ticket)
+
+    def abort(self) -> None:
+        ticket, self._ticket = self._ticket, None
+        cap = self._capability() if ticket else None
+        if cap is not None:
+            try:
+                cap.abort_dispatch(ticket)
+            except Exception:
+                logger.warning("A2A dispatch abort failed", exc_info=True)
+
+
 class A2AAdapter(BasePlatformAdapter):
     """Inbound A2A server adapter."""
 
@@ -281,6 +364,13 @@ class A2AAdapter(BasePlatformAdapter):
         # the profile scope contextvar (same class as A2A_PORT above).
         self._public_url = _get_scoped_secret("A2A_PUBLIC_URL", "").strip()
         self._agents = self._load_served_agents(extra)
+        self._tls = threading.local()  # per HTTP worker: durable admission receipt of the current request
+        self._recovered_ids: set[str] = set()  # pending tasks whose reply may arrive after the waiter is gone
+        self._completion_lock = threading.Lock()
+        self._completion_pool = None
+        self._shutting_down = False
+        self._thread_inbound: dict[str, dict] = {}  # task_id -> admitted inbound envelope (conversation only)
+        self._thread_replies: dict[str, dict] = {}
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._server_thread = self._watchdog_thread = None  # type: Optional[threading.Thread]
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -322,6 +412,9 @@ class A2AAdapter(BasePlatformAdapter):
             logger.error("A2A: could not bind %s:%s — %s", self.host, self.port, e)
             self._set_fatal_error("bind_failed", f"A2A bind failed: {e}", retryable=True)
             return False
+        # A successful reconnect starts a new lifecycle. The previous disconnect
+        # must not suppress completion callbacks for this server instance.
+        self._shutting_down = False
         self._httpd.daemon_threads = True
         self._httpd.adapter = self  # type: ignore[attr-defined]
         self._server_thread = _daemon_thread(self._httpd.serve_forever, "a2a-http")
@@ -341,6 +434,7 @@ class A2AAdapter(BasePlatformAdapter):
                 self._httpd.shutdown()
                 self._httpd.server_close()
             self._httpd = None
+        self._shutting_down = True  # completion hooks must not terminalize durable work any more
         # Fail any in-flight replies so blocked HTTP threads don't hang.
         with self._pending_lock:
             for tid in list(self._pending):
@@ -348,6 +442,11 @@ class A2AAdapter(BasePlatformAdapter):
             self._pending.clear()
             self._pending_order.clear()
             self._active_tasks.clear()
+        self._recovered_ids.clear()  # `_thread_inbound` (the durable inbound binding) is deliberately kept
+        with self._completion_lock:
+            pool, self._completion_pool = self._completion_pool, None
+        if pool is not None:  # finalizers end with the adapter; durable work stays nonterminal
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def _watchdog_loop(self) -> None:
         """Background thread that fails orphaned tasks (keeps them queryable)."""
@@ -501,7 +600,10 @@ class A2AAdapter(BasePlatformAdapter):
         entry = self._pending.get(task_id)
         if not entry or entry[1].done():
             return False
-        entry[1].set_result((state, text))
+        if (task_id in self._recovered_ids or task_id in self._thread_inbound) and state != protocol.STATE_COMPLETED:
+            entry[1].set_result(_Lifecycle(state))  # shutdown / cancel / processing signal: not a reply
+        else:
+            entry[1].set_result((state, text))
         return True
 
     def _resolve_task(self, task_id: str, state: str, text: str) -> bool:
@@ -525,51 +627,280 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
+    def _is_conversational(self, params: dict) -> bool:
+        """Only an explicit work-art changes the path; absent art is conversation."""
+        return str(params.get("art") or "gespraech").lower() != "arbeitsauftrag"
+
+    def _receive_thread_sync(self, params: dict, text: str, *, peer: str, agent: dict):
+        """Admission barrier: the complete masked envelope is validated and authenticated by the
+        recipient's own runner-issued capability before any task, audit or session exists."""
+        capability = self.gateway_context()
+        if capability is None or not callable(getattr(capability, "receive_wire", None)):
+            raise RuntimeError("sitzung_unmaskiert: authenticated ThreadSync capability is not available")
+        wire = params.get("thread_contract")
+        if not isinstance(wire, dict) or wire.get("text") != text or wire.get("transport") != "a2a":
+            raise RuntimeError("envelope_ungueltig: complete thread_contract required")
+        # The peer was authenticated by this adapter's inbound security layer to reach here.
+        capability.attest("a2a_admission")
+        return capability.receive_wire(wire, peer=peer, external_dispatch=True)
+
     def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+        """Run the request and attach the recipient's durable admission receipt (``thread_admission``)
+        to the response. No receipt means the message was NOT durably admitted: the sender must retry."""
+        self._tls.receipt = None
+        terminal, pending = self._prepare_task_inner(params, peer, agent)
+        receipt, self._tls.receipt = getattr(self._tls, "receipt", None), None
+        if receipt:
+            if terminal is not None:
+                terminal.setdefault("metadata", {})["thread_admission"] = receipt
+            if pending is not None:
+                pending["admission"] = receipt
+        return terminal, pending
+
+    def _prepare_task_inner(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
         """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
         (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
-        context_id = protocol.extract_context_id(params) or protocol.new_context_id()
-        task_id = protocol.new_task_id()
-        turn = self._turns.track(context_id)
-        max_turns = protocol.max_pingpong_turns()
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
-        if turn > max_turns:
-            protocol.metrics.anti_loop_triggers += 1
-            logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
-            return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
-                                  f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
+        inbound_wire = None
+        dispatch = _Dispatch(self, None)
         if not text:
-            return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
-        framed = security.wrap_inbound(peer, text)
+            return ({"id": "", "contextId": "", "status": {"state": protocol.STATE_REJECTED,
+                    "message": {"role": "agent", "parts": [{"kind": "text", "text": "Empty task — nothing to do."}]}}}, None)
+        if self._is_conversational(params):
+            # This is the admission barrier: no context/task ID, turn tracking,
+            # persistence, audit, session, or future exists before it succeeds.
+            try:
+                admission = self._receive_thread_sync(params, text, peer=peer, agent=agent)
+                wire = params["thread_contract"]
+                receipt = {"message_id": wire.get("message_id"), "envelope_digest": wire.get("envelope_digest")}
+                if admission.status == "duplicate":
+                    # Replay of a COMPLETED message: no model run. If its reply is durable, hand the
+                    # sender that reply contract (it validates + projects it once); else just duplicate.
+                    self._tls.receipt = {**receipt, "status": "duplicate"}
+                    capability = self.gateway_context()
+                    reply_wire = capability.reply_for(wire) if hasattr(capability, "reply_for") else None
+                    if reply_wire:
+                        return (protocol.build_task(
+                            "reply-" + str(wire.get("message_id")), protocol.extract_context_id(params) or "",
+                            protocol.STATE_COMPLETED, reply_wire["text"],
+                            metadata={"thread_contract": reply_wire}), None)
+                    return ({"id": "", "contextId": protocol.extract_context_id(params) or "", "status": {"state": protocol.STATE_REJECTED,
+                            "message": {"role": "agent", "parts": [{"kind": "text", "text": "duplicate_nachricht"}]}}}, None)
+                if admission.status != "admitted" or admission.ticket is None:
+                    return ({"id": "", "contextId": "", "status": {"state": protocol.STATE_FAILED,
+                            "message": {"role": "agent", "parts": [{"kind": "text", "text": admission.reason or "admission refused"}]}}}, None)
+            except Exception:
+                logger.warning("A2A incoming ThreadSync failed closed", exc_info=True)
+                return ({"id": "", "contextId": "", "status": {"state": protocol.STATE_FAILED,
+                        "message": {"role": "agent", "parts": [{"kind": "text", "text": "sitzung_unmaskiert"}]}}}, None)
+            # The inbound envelope is never allowed to re-enter the ordinary A2A
+            # persistence path in clear text after admission.
+            from tools.bot_thread_sync import mask_text
+            text = mask_text(text).text
+            inbound_wire = params["thread_contract"]
+            dispatch = _Dispatch(self, admission.ticket)
+            self._tls.receipt = {**receipt, "status": "admitted"}
+        task_id = None
+        try:
+            context_id = protocol.extract_context_id(params) or protocol.new_context_id()
+            task_id = protocol.new_task_id()
+            if inbound_wire is not None:
+                self._thread_inbound[task_id] = inbound_wire
+            turn = self._turns.track(context_id)
+            max_turns = protocol.max_pingpong_turns()
+            rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+            if turn > max_turns:
+                protocol.metrics.anti_loop_triggers += 1
+                logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
+                return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
+                                      f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
+            framed = security.wrap_inbound(peer, text)
+            security.audit("inbound", peer, task_id, text)
+            protocol.persist_message(context_id, "user", text, task_id)
+            protocol.metrics.inbound_total += 1
+            self._register_inline_push(task_id, params, agent=agent)
+            if not agent.get("local", True):
+                self._activate_task(task_id)
+                try:
+                    reply, state = self._forward_to_profile(agent, peer, context_id, framed)
+                    self._record_outcome(task_id, context_id, peer, state, reply)
+                    if state != protocol.STATE_FAILED and not dispatch.ack():
+                        return protocol.build_task(task_id, context_id, protocol.STATE_FAILED, "ack_fehlgeschlagen",
+                                                   created_at=rec["created_iso"]), None
+                    return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+                finally:
+                    self._pop_pending(task_id)
+            if self._loop is None or self._message_handler is None:
+                return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
+            fut = self._add_pending(task_id, context_id)
+            event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
+                                 source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+            if dispatch.pending:
+                event.metadata = {**(event.metadata or {}), "thread_dispatch_key": dispatch.ticket.get("key", "")}
+            refusal = None
+            event._thread_handoff = None
+            try:
+                if dispatch.pending:
+                    # Conversation: the coroutine takes the durable PENDING -> RUNNING claim itself,
+                    # immediately before the model is invoked, and records the gateway's answer.
+                    coro = self._handoff(event, dispatch.ticket)
+                else:
+                    coro = self.handle_message(event)
+                submitted = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                if dispatch.pending:  # conversation only: work tasks keep their fire-and-forget dispatch
+                    try:
+                        submitted.result(timeout=_GATEWAY_ACCEPT_TIMEOUT)
+                    except FuturesTimeout:
+                        submitted.cancel()  # outcome unknown: a begun (RUNNING) record is never re-submitted
+                        refusal = "gateway_timeout"
+                    if refusal is None and event._thread_handoff == "not_begun":
+                        refusal = "dispatch_nicht_beginnbar"
+                    elif refusal is None and getattr(event, "_gateway_accepted", False) is not True:
+                        refusal = "gateway_abgelehnt"
+            except Exception as e:
+                refusal = f"Dispatch failed: {e}"
+            if refusal is not None:
+                # Not accepted: the claim is released by the finally below, the message stays retryable.
+                msg = security.redact_outbound(refusal)
+                try:
+                    return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+                finally:
+                    self._pop_pending(task_id)
+            dispatch.scheduled()  # durable ACCEPTED = SCHEDULED; completion terminalizes it later
+            self.tasks.set_state(task_id, protocol.STATE_WORKING)
+            return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+        finally:
+            if dispatch.pending:  # not acknowledged: release the claim so a retry can resume
+                if getattr(self._tls, "receipt", None):
+                    # durably queued at the recipient (inbox + recovery row); the gateway takes it later
+                    self._tls.receipt = {**self._tls.receipt, "status": "queued"}
+                dispatch.abort()
+                self._thread_inbound.pop(task_id, None)
+
+    def _reply_expected(self, task_id: str) -> bool:
+        """After the gateway finished the turn: a reply was delivered (or already finalized) -> True; a
+        still-unresolved waiter means the run ended WITHOUT any reply (typed, intentional no-reply)."""
+        with self._pending_lock:
+            entry = self._pending.get(task_id)
+        return not (entry is not None and not entry[1].done())
+
+    async def _handoff(self, event, ticket: dict) -> None:
+        """Gateway handoff of one admitted message, idempotent through the durable dispatch record.
+        Acceptance only SCHEDULES the run; `event.on_complete` terminalizes after the model really ran."""
+        cap = self.gateway_context()
+        began = False
+
+        async def on_complete(outcome: str) -> None:
+            if outcome == "completed" and not self._shutting_down:  # failed/cancelled stay recoverable
+                fresh = self.gateway_context()
+                if fresh is not None:
+                    expected = self._reply_expected(event.message_id)
+                    await asyncio.to_thread(fresh.dispatch_finish, ticket, outcome, expected)
+                    if not expected:
+                        self._resolve_task(event.message_id, protocol.STATE_CANCELED, "")  # release the waiter
+
+        try:
+            began = bool(cap is not None and await asyncio.to_thread(cap.dispatch_begin, ticket))
+            if not began:
+                event._thread_handoff = "not_begun"  # RUNNING/ACCEPTED elsewhere or fenced out: no model run
+                return
+            event.on_complete = on_complete
+            await self.handle_message(event)
+        except Exception:
+            if began:  # the gateway raised before taking it: the model never started
+                await asyncio.to_thread(cap.dispatch_release, ticket)
+            raise
+        if getattr(event, "_gateway_accepted", False) is True:
+            await asyncio.to_thread(cap.dispatch_accepted, ticket)  # SCHEDULED (not completed)
+        else:
+            await asyncio.to_thread(cap.dispatch_release, ticket)
+
+    def dispatch_thread_message(self, envelope, complete=None) -> Optional[bool]:
+        """Recovery hand-off of a queued conversational message (ThreadSync already holds the durable
+        RUNNING claim). True accepted, False refused, None outcome unknown (never re-submitted).
+        The recovered task's reply is not returned to the original (gone) HTTP caller."""
+        if self._loop is None or self._message_handler is None:
+            return False
+        from tools.bot_thread_sync import dispatch_key, mask_text
+        peer, text = envelope.sender, mask_text(envelope.text).text
+        context_id, task_id, agent = envelope.conversation_id, protocol.new_task_id(), self._agents[""]
+        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent))
+        self._thread_inbound[task_id] = envelope.to_wire()
         security.audit("inbound", peer, task_id, text)
         protocol.persist_message(context_id, "user", text, task_id)
-        protocol.metrics.inbound_total += 1
-        self._register_inline_push(task_id, params, agent=agent)
-        if not agent.get("local", True):
-            self._activate_task(task_id)
-            try:
-                reply, state = self._forward_to_profile(agent, peer, context_id, framed)
-                self._record_outcome(task_id, context_id, peer, state, reply)
-                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
-            finally:
-                self._pop_pending(task_id)
-        if self._loop is None or self._message_handler is None:
-            return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
         fut = self._add_pending(task_id, context_id)
-        event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        event = MessageEvent(text=security.wrap_inbound(peer, text), message_type=MessageType.TEXT, message_id=task_id,
+                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm",
+                                                      user_id=peer, user_name=peer))
+        event.metadata = {**(event.metadata or {}), "thread_dispatch_key": dispatch_key(
+            envelope.tenant, envelope.conversation_id, envelope.message_id, envelope.recipient)}
+        if complete is not None:  # gateway completion terminalizes the durable row (not acceptance)
+            async def on_complete(result: str, _complete=complete) -> None:
+                if not self._shutting_down:
+                    expected = self._reply_expected(task_id)
+                    await asyncio.to_thread(_complete, result, expected)
+                    if result == "completed" and not expected:
+                        self._resolve_task(task_id, protocol.STATE_CANCELED, "")
+            event.on_complete = on_complete
+        outcome: Optional[bool]
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
-        except Exception as e:
-            msg = security.redact_outbound(f"Dispatch failed: {e}")
-            try:
-                return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
-            finally:
-                self._pop_pending(task_id)
+            submitted = asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+            submitted.result(timeout=_GATEWAY_ACCEPT_TIMEOUT)
+            outcome = getattr(event, "_gateway_accepted", False) is True
+        except FuturesTimeout:
+            submitted.cancel()
+            outcome = None
+        except Exception:
+            outcome = False
+        if outcome is not True:
+            self._thread_inbound.pop(task_id, None)
+            self._pop_pending(task_id)
+            if outcome is False:
+                self._end_task(rec, protocol.STATE_FAILED, "gateway_abgelehnt")
+            return outcome
         self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+        pending = {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
+                   "created_iso": rec["created_iso"], "started": time.time()}
+        self._completion_executor()  # the finalizer pool exists as soon as work is recovered
+        self._recovered_ids.add(task_id)
+        self._arm_late_finalization(pending)
+        return True
+
+    def _completion_executor(self):
+        """Finalizer pool (own lock: callbacks may fire while `_pending_lock` is held)."""
+        with self._completion_lock:
+            if self._completion_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self._completion_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="a2a-recovered")
+            return self._completion_pool
+
+    def _arm_late_finalization(self, pending: dict) -> None:
+        """Detach the waiter WITHOUT touching the durable work item: whenever the model's genuine reply
+        arrives (this process), it is finalized exactly once through `_finalize_task`. Lifecycle outcomes
+        (shutdown, cancel, timeout) never finalize anything; the dispatch row stays nonterminal."""
+        self._recovered_ids.add(pending["task_id"])
+        pending["future"].add_done_callback(lambda fut: self._on_late_reply(pending, fut))
+
+    def _on_late_reply(self, pending: dict, fut) -> None:
+        try:
+            result = fut.result()
+        except BaseException:
+            return
+        if not (isinstance(result, tuple) and len(result) == 2) or self._shutting_down:
+            return  # _Lifecycle or shutting down: nothing to finalize, work stays recoverable
+        try:
+            self._completion_executor().submit(self._finalize_late, pending, *result)
+        except RuntimeError:
+            return  # pool already shut down
+
+    def _finalize_late(self, pending: dict, state: str, reply: str) -> None:
+        try:
+            self._finalize_task(pending, state, reply)
+        except Exception:
+            logger.warning("A2A late finalization failed for %s", pending["task_id"], exc_info=True)
+        finally:
+            self._recovered_ids.discard(pending["task_id"])
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str) -> tuple[str, str]:
         """Forward a routed task to another local profile via ``hermes chat``. First contact creates a
@@ -624,12 +955,59 @@ class A2AAdapter(BasePlatformAdapter):
         self.tasks.complete(task_id, state, reply)
         self._send_push_notification(task_id, context_id, reply, state)
 
+    def _mask_conversational_reply(self, task_id: str, wire: dict, state: str, reply: str) -> tuple[str, str]:
+        """Conversation replies leave only after receiver-side ThreadSync masking + proof (this
+        profile's own secrets), parented to the inbound message. Any failure withholds the reply."""
+        capability = self.gateway_context()
+        sender = getattr(capability, "send_reply", None)
+        try:
+            result, envelope = sender(wire, reply) if callable(sender) else (None, None)
+        except Exception:
+            logger.warning("A2A conversational reply masking failed closed", exc_info=True)
+            result, envelope = None, None
+        if envelope is None:
+            reason = getattr(result, "reason", "") or "maskierung_unbelegt"
+            return protocol.STATE_FAILED, f"[reply withheld: {reason}]"
+        self._thread_replies[task_id] = envelope.to_wire()
+        return state, envelope.text
+
     def _finalize_task(self, pending: dict, state: str, reply: str) -> tuple[str, str]:
         """Record a dispatched task's outcome; returns (state, reply) after redaction and
         input-required detection (a leading marker flags a clarification request)."""
         task_id, context_id, peer = pending["task_id"], pending["context_id"], pending["peer"]
+        if isinstance(state, _Lifecycle) or isinstance(reply, _Lifecycle):
+            signal = state if isinstance(state, _Lifecycle) else reply
+            if task_id not in self._thread_inbound and task_id not in self._recovered_ids:
+                # Ordinary work task: no durable conversation binding, keep its established terminal failure.
+                state, reply = protocol.STATE_FAILED, {"timeout": "[agent did not reply in time]",
+                                                       "client_gone": "[client disconnected]"}.get(
+                    signal.state, "[agent unavailable]")
+                signal = None
+        else:
+            signal = None
+        if signal is not None:
+            # A lifecycle outcome (timeout / client gone / shutdown) is NOT a model result: transport status
+            # for the HTTP caller only. No reply envelope, projection, task completion or ThreadSync
+            # completion; the durable work item and its inbound binding stay as they are, and a genuine
+            # late reply (same process) is finalized once by the late-finalization callback.
+            signal = state if isinstance(state, _Lifecycle) else reply
+            if not self._shutting_down and not pending["future"].done():
+                self._arm_late_finalization(pending)
+            return protocol.STATE_FAILED, {"timeout": "[agent did not reply in time]",
+                                           "client_gone": "[client disconnected]"}.get(
+                signal.state, "[agent unavailable]")
         try:
             reply = security.redact_outbound(reply or "")
+            wire = self._thread_inbound.pop(task_id, None)
+            if wire is not None and reply and state == protocol.STATE_COMPLETED:  # genuine model reply only
+                state, reply = self._mask_conversational_reply(task_id, wire, state, reply)
+                if state == protocol.STATE_COMPLETED:  # reply durable -> only now finalize the turn
+                    capability = self.gateway_context()
+                    try:
+                        if not (capability is not None and capability.finalize_reply(wire)):
+                            logger.warning("A2A turn not finalized after durable reply (%s)", task_id)
+                    except Exception:
+                        logger.warning("A2A turn finalization failed (%s)", task_id, exc_info=True)
             stripped = reply.lstrip()
             if state == protocol.STATE_COMPLETED and stripped.upper().startswith(protocol.INPUT_REQUIRED_MARKER):
                 state, reply = protocol.STATE_INPUT_REQUIRED, stripped[len(protocol.INPUT_REQUIRED_MARKER):].strip()
@@ -652,19 +1030,33 @@ class A2AAdapter(BasePlatformAdapter):
                     try:
                         keepalive()
                     except Exception:
-                        return (protocol.STATE_FAILED, "[client disconnected]")
+                        return _CLIENT_GONE
             except Exception:
                 return on_timeout
 
-    def _await_reply(self, pending: dict, keepalive=None) -> tuple[str, str]:
-        return self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
-                                  (protocol.STATE_FAILED, "[agent did not reply in time]"))
+    def _await_reply(self, pending: dict, keepalive=None):
+        """Wait for the reply. For conversational tasks a local wait ending (timeout, client gone) or a
+        lifecycle cancellation is returned as a typed `_Lifecycle`, never as a model-result tuple."""
+        res = self._await_future(pending["future"], pending["started"] + _reply_timeout(), keepalive,
+                                 _TIMEOUT_RESULT)
+        conversational = pending["task_id"] in self._thread_inbound or pending["task_id"] in self._recovered_ids
+        if isinstance(res, _Lifecycle):
+            return res, ""
+        if conversational and res is _TIMEOUT_RESULT:
+            return _Lifecycle("timeout"), ""
+        if conversational and res is _CLIENT_GONE:
+            return _Lifecycle("client_gone"), ""
+        return res
 
     def _rpc_message_send(self, req_id: Any, params: dict, peer: str, agent: Optional[dict] = None, v1_response: bool = False) -> dict:
         task, pending = self._prepare_task(params, peer, agent=agent)
         if task is None:
             state, reply = self._finalize_task(pending, *self._await_reply(pending))
-            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply, created_at=pending["created_iso"])
+            contract = self._thread_replies.pop(pending["task_id"], None)
+            task = protocol.build_task(pending["task_id"], pending["context_id"], state, reply,
+                                       created_at=pending["created_iso"],
+                                       metadata={**({"thread_contract": contract} if contract else {}),
+                                                 **({"thread_admission": pending["admission"]} if pending.get("admission") else {})} or None)
         return _ok(req_id, protocol.send_message_response(task) if v1_response else task)
 
     @staticmethod
@@ -705,7 +1097,8 @@ class A2AAdapter(BasePlatformAdapter):
                 return self._emit_terminal(handler, terminal["id"], terminal["contextId"], terminal["status"]["state"],
                                            protocol.extract_text(terminal.get("status", {}).get("message", {}) or {}), req_id=req_id)
             task_id, context_id = pending["task_id"], pending["context_id"]
-            submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"])
+            submitted = protocol.build_task(task_id, context_id, protocol.STATE_SUBMITTED, created_at=pending["created_iso"],
+                                            metadata={"thread_admission": pending["admission"]} if pending.get("admission") else None)
             self._sse_write(handler, protocol.sse_data(protocol.stream_task(submitted), req_id))
             self._sse_write(handler, protocol.sse_data(protocol.status_update(task_id, context_id, protocol.STATE_WORKING), req_id))
             state, reply = self._finalize_task(pending, *self._await_reply(pending, keepalive=self._keepalive(handler)))
@@ -713,7 +1106,7 @@ class A2AAdapter(BasePlatformAdapter):
             self._emit_terminal(handler, task_id, context_id, state, reply, req_id=req_id)
         except (BrokenPipeError, ConnectionResetError):
             if pending is not None:
-                self._finalize_task(pending, protocol.STATE_FAILED, "[client disconnected]")
+                self._finalize_task(pending, _Lifecycle("client_gone"), "")  # typed, nonterminal for conversations
             logger.debug("A2A: stream client disconnected")
 
     def _rpc_tasks_subscribe(self, handler, req_id: Any, params: dict, agent: Optional[dict] = None) -> None:

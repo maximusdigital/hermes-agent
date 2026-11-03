@@ -1606,8 +1606,35 @@ class GatewayStartupMixin:
         self._update_runtime_status(self._serving_state())
         await self._start_finish_wiring(connected_count)
         self._start_spawn_background_watchers()
+        self._recover_thread_sync()
         logger.info("Press Ctrl+C to stop")
         return True
+
+    def _recover_thread_sync(self) -> None:
+        """One bounded recovery loop per ACTIVE profile (primary + multiplexed secondaries)."""
+        from gateway.run_thread_context import active_profile_scopes
+        tasks = self.__dict__.setdefault("_thread_sync_tasks", {})
+        try:
+            scopes = active_profile_scopes(self)
+        except Exception:
+            logger.warning("ThreadSync profile scopes unavailable; recovery not scheduled", exc_info=True)
+            return
+        for scope in scopes:
+            existing = tasks.get(scope[0])
+            if existing is None or existing.done():
+                tasks[scope[0]] = asyncio.create_task(self._thread_sync_recovery_loop(scope))
+
+    async def _thread_sync_recovery_loop(self, scope) -> None:
+        from gateway.run_thread_context import thread_sync_recovery_pass
+        while getattr(self, "_running", False):
+            try:
+                delay = await asyncio.to_thread(thread_sync_recovery_pass, self, scope)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("ThreadSync recovery pass failed for %s; queues stay durable", scope[0], exc_info=True)
+                delay = 60.0
+            await asyncio.sleep(delay)
 
     @dataclasses.dataclass
     class _HandoffDestination:

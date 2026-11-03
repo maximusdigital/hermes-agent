@@ -221,6 +221,28 @@ async def test_debounce_resets_timer_on_new_arrival():
 
 
 @pytest.mark.asyncio
+async def test_debounced_accepted_events_keep_every_completion_hook():
+    adapter = _make_adapter()
+    completed = []
+    first = _make_event("one")
+    second = _make_event("two")
+    setattr(first, "on_complete", lambda outcome: completed.append(("one", outcome)))
+    setattr(second, "on_complete", lambda outcome: completed.append(("two", outcome)))
+    session_key = build_session_key(first.source)
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter.handle_message(first)
+    await adapter.handle_message(second)
+
+    assert first._gateway_accepted is True
+    assert second._gateway_accepted is True
+    buffered = adapter._text_debounce[session_key].event
+    await adapter._fire_event_completion(buffered, "completed")
+    assert completed == [("one", "completed"), ("two", "completed")]
+    adapter._discard_text_debounce(session_key)
+
+
+@pytest.mark.asyncio
 async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter = _make_adapter()
     started: list[str] = []

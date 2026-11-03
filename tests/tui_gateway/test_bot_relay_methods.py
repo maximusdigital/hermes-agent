@@ -108,7 +108,8 @@ def test_outbox_drain_reoffers_a_claimed_envelope_the_desktop_never_delivered(ho
     lost_path.write_text(json.dumps(stale), encoding="utf-8")
     assert _result(drain(5, {}))["envelopes"] == []
     reply = json.loads((bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{lost['id']}.json").read_text(encoding="utf-8"))
-    assert reply["reason"] == "delivery_timeout" and reply["error"]
+    payload = json.loads((bot_relay.relay_root(home) / reply["payload_ref"]).read_text(encoding="utf-8"))
+    assert reply["reason"] == "delivery_timeout" and "error" not in reply and payload["error"]
 
 
 def test_deliver_validates_profile_and_runs_transport(home, monkeypatch):
@@ -376,7 +377,9 @@ def test_reply_roundtrip_and_id_validation(home):
     envelope_id = "c" * 32
     _result(srv._methods["bot_relay.reply"](1, {"id": envelope_id, "reply": "hi"}))
     path = bot_relay.relay_root(home) / bot_relay.REPLIES_DIR / f"{envelope_id}.json"
-    assert json.loads(path.read_text(encoding="utf-8"))["reply"] == "hi"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    payload = json.loads((bot_relay.relay_root(home) / data["payload_ref"]).read_text(encoding="utf-8"))
+    assert "reply" not in data and payload["value"] == "hi"
 
     err = srv._methods["bot_relay.reply"](2, {"id": "../evil"})
     assert "error" in err

@@ -182,7 +182,8 @@ def extract_context_id(params: dict) -> str:
     return (str(msg.get("contextId") or "") if isinstance(msg, dict) else "") or str(params.get("contextId") or "")
 
 
-def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "") -> dict:
+def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", *, created_at: str = "",
+               metadata: Optional[dict] = None) -> dict:
     """A2A v1.0 Task. ``created_at`` is accepted but NOT serialized: the v1.0 Task proto has no
     createdAt and strict ProtoJSON parsers (a2a-sdk) reject unknown fields."""
     task: dict[str, Any] = {"id": task_id, "contextId": context_id, "status": {"state": state, "timestamp": now_iso()}}
@@ -190,6 +191,8 @@ def build_task(task_id: str, context_id: str, state: str, agent_text: str = "", 
         task["status"]["message"] = text_message(ROLE_AGENT, agent_text, context_id)
         if state == STATE_COMPLETED:
             task["artifacts"] = [{"artifactId": uuid.uuid4().hex, "parts": [text_part(agent_text)]}]
+    if metadata:
+        task["metadata"] = metadata
     return task
 
 
@@ -441,7 +444,8 @@ def persist_message(context_id: str, role: str, text: str, task_id: str = "") ->
         path = _conv_path(context_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps({"ts": time.time(), "role": role, "text": text, "task_id": task_id}, ensure_ascii=False) + "\n")
+            fh.write(json.dumps({"ts": time.time(), "role": role, "text": text, "messageId": task_id,
+                                 "task_id": task_id}, ensure_ascii=False) + "\n")
     except Exception:
         pass
 

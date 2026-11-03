@@ -1676,7 +1676,19 @@ class GatewayAdapterLifecycleMixin:
         adapter = self._instantiate_adapter(platform, config)
         if adapter is not None:
             adapter.gateway_runner = self
+            setter = getattr(adapter, "set_gateway_context_factory", None)
+            if callable(setter):
+                setter(lambda adapter=adapter: self.build_gateway_extension_context(adapter))
         return adapter
+
+    def build_gateway_extension_context(self, adapter: BasePlatformAdapter) -> Any:
+        """Resolve authenticated context for generic adapter extensions.
+
+        The runner owns authentication and profile scope; plugins consume only this
+        framework seam and never require a plugin-specific core branch.
+        """
+        from gateway.run_thread_context import build_gateway_extension_context
+        return build_gateway_extension_context(self, adapter)
 
     def _instantiate_adapter(self, platform: Platform, config: Any) -> Optional[BasePlatformAdapter]:
         """Instantiate the adapter for a platform: plugin registry first, then built-ins."""
