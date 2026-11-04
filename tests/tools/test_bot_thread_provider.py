@@ -66,7 +66,17 @@ def world(tmp_path, monkeypatch):
         assert c is not None
         import tests.tools.bot_thread_support as _support
         c._sync.clock = lambda: _support.time.time()  # one wall clock for grants AND the engine (tests may skew it)
-        return c
+        return TestCapability(c)
+
+    class TestCapability:
+        def __init__(self, inner): self._inner = inner
+        def __getattr__(self, name): return getattr(self._inner, name)
+        def send(self, **kwargs):
+            from tools.bot_thread_sync import new_message_id
+            kwargs.setdefault("message_id", new_message_id())
+            if kwargs.get("transport") == "a2a":
+                self._inner.attest("a2a_ids")
+            return self._inner.send(**kwargs)
 
     class W:
         pass
@@ -440,7 +450,8 @@ def _roundtrip(world, monkeypatch, reply_text, *, mutate=None, strip=False):
         if mutate:
             wire = mutate(wire)
         receipt = {"message_id": contract["message_id"], "envelope_digest": contract["envelope_digest"],
-                   "status": "admitted"}
+                   "wire_message_id": body["params"]["message"]["messageId"],
+                   "wire_context_id": body["params"]["message"]["contextId"], "status": "admitted"}
         task = protocol.build_task("t", body["params"]["message"]["contextId"], protocol.STATE_COMPLETED, reply.text,
                                    metadata={"thread_admission": receipt, **({} if strip else {"thread_contract": wire})})
         return protocol.jsonrpc_result(body["id"], task)
@@ -516,7 +527,8 @@ def test_sender_is_done_only_with_the_recipients_durable_admission_receipt(world
         seen.append(res.status)
         b.abort_dispatch(res.ticket)  # recipient gateway is down: admitted + queued, nothing dispatched
         receipt = {"message_id": contract["message_id"], "envelope_digest": contract["envelope_digest"],
-                   "status": "queued"}
+                   "wire_message_id": body["params"]["message"]["messageId"],
+                   "wire_context_id": body["params"]["message"]["contextId"], "status": "queued"}
         return protocol.jsonrpc_result(body["id"], protocol.build_task(
             "t", ctx, protocol.STATE_FAILED, "gateway not ready", metadata={"thread_admission": receipt}))
 
@@ -753,7 +765,7 @@ def test_waiter_timeout_detaches_without_a_reply_and_the_late_genuine_reply_fina
     monkeypatch.setattr("plugins.platforms.a2a.adapter.asyncio.run_coroutine_threadsafe", submit)
     adapter = _receiver_adapter(world, ready=True)
     wire = _a2a_wire(world)
-    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1"),
+    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1", message_id=wire["message_id"]),
               "thread_contract": wire}
     terminal, pending = adapter._prepare_task(params, "p")
     assert terminal is None and pending is not None
@@ -818,7 +830,7 @@ def test_live_task_shutdown_is_typed_lifecycle_binding_retained_and_restart_yiel
     monkeypatch.setattr("plugins.platforms.a2a.adapter.asyncio.run_coroutine_threadsafe", submit)
     adapter = _receiver_adapter(world, ready=True)
     wire = _a2a_wire(world)
-    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1"),
+    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1", message_id=wire["message_id"]),
               "thread_contract": wire}
     terminal, pending = adapter._prepare_task(params, "p")
     task_id = pending["task_id"]
@@ -885,7 +897,7 @@ def test_streaming_client_disconnect_is_typed_nonterminal_and_the_late_genuine_r
     handler = SimpleNamespace(send_response=lambda *a: None, send_header=lambda *a: None,
                               end_headers=lambda: None, wfile=Wire())
     wire = _a2a_wire(world)
-    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1"),
+    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1", message_id=wire["message_id"]),
               "thread_contract": wire}
     adapter._rpc_message_stream(handler, "1", params, "p")
     (task_id,) = list(adapter._pending)  # waiter detached, the work item and its future are NOT dropped
@@ -947,7 +959,7 @@ def _scheduled_live(world, monkeypatch):
                         lambda coro, loop: (lambda f: (f.set_result(asyncio.run(coro)), f)[1])(concurrent.futures.Future()))
     adapter = _receiver_adapter(world, ready=True)
     wire = _a2a_wire(world)
-    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1"),
+    params = {"message": protocol.text_message(protocol.ROLE_USER, wire["text"], context_id="conv-1", message_id=wire["message_id"]),
               "thread_contract": wire}
     terminal, pending = adapter._prepare_task(params, "p")
     assert terminal is None

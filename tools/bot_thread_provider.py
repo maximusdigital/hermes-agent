@@ -19,7 +19,7 @@ from typing import Any
 from tools import pinned_fs
 from tools.bot_thread_authority import GrantBroker
 from tools.bot_thread_sync import (
-    AuthorityLost, GatewayAuthContext, Journal, dispatch_key, Owner, SyncResult, ThreadEnvelope, ThreadSync, derive_storage_key, mask_text,
+    AuthorityLost, GatewayAuthContext, Journal, dispatch_key, Owner, SyncResult, ThreadEnvelope, ThreadSync, _valid_message_id, derive_storage_key, mask_text,
     profile_secret_values,
 )
 
@@ -224,7 +224,8 @@ class ThreadSyncCapability:
     @_requires_authority(_blocked)
     def send(self, *, target: str, message: str, art: str = "gespraech", projection_requested: bool = False,
              transport: str = "message_agent", peer_thread: dict | None = None,
-             wire_transport: Any = None, recipient: str | None = None, **_ignored: Any) -> SyncResult:
+             wire_transport: Any = None, recipient: str | None = None, message_id: str | None = None,
+             **_ignored: Any) -> SyncResult:
         """Model-supplied ids/threads/tenant are ignored: identity is derived from context + journal."""
         resolved = _target(Path(self._ctx.profile_home), target) if peer_thread is None else None
         if not self._live():  # blocking target resolver: re-validate before any journal/route write
@@ -238,9 +239,13 @@ class ThreadSyncCapability:
         if wire_transport is not None:
             self._wire[transport] = wire_transport
         conversation_id = conversation_id_for(self._ctx.tenant, self._ctx.profile, profile)
+        if not _valid_message_id(message_id):
+            return SyncResult("blocked", "envelope_ungueltig")
+        if any(row.get("message_id") == message_id for row in self._sync.journal.events(conversation_id)):
+            return SyncResult("blocked", "envelope_ungueltig", message_id=message_id)
         parent = self._parent(conversation_id)
         envelope = ThreadEnvelope(
-            conversation_id=conversation_id, message_id=os.urandom(12).hex(), parent_message_id=parent,
+            conversation_id=conversation_id, message_id=message_id, parent_message_id=parent,
             sender=self._ctx.profile, recipient=profile, tenant=self._ctx.tenant,
             tenant_source="gateway_context", source_thread=dict(self._ctx.thread), target_thread=thread,
             text=str(message), transport=transport, art=art if art in {"gespraech", "arbeitsauftrag"} else "gespraech",
@@ -461,6 +466,7 @@ class ThreadSyncCapability:
         is_a2a = inbound.transport == "a2a"
         if is_a2a:  # the live HTTP response carries it; nothing is transported from here
             self._wire["a2a"] = lambda payload: None
+            self._sync.attest("a2a_ids")
         # Stable reply identity: a re-run of the model (ambiguous crash) can never create a second
         # visible reply projection; the first durable reply wins and is returned again.
         reply_id = _reply_id(inbound.conversation_id, inbound.message_id, self._ctx.profile)
@@ -587,6 +593,7 @@ class ThreadSyncCapability:
         """Startup: ingest the recipient inbox, then retry both queues. Bounded, no polling."""
         # Queued conversational entries exist only because an authenticated admission happened first.
         self._sync.attest("a2a_admission")
+        self._sync.attest("a2a_ids")
         with _profile_scope(self._ctx.profile_home):
             count = self._drain_held()  # finished-but-unstored model results first (no rerun)
             count += self.flush_pending_replies()  # persisted replies first: never re-run a model for them

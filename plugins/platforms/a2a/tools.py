@@ -113,7 +113,9 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str,
     # so the receiver's digest/proof check holds.
     safe_message = envelope.text if envelope is not None else mask_text(security.redact_outbound(message)).text
     # v1.0: contextId lives inside the Message, not at the params top level.
-    wire_message = protocol.text_message(protocol.ROLE_USER, safe_message, context_id=ctx)
+    wire_message = protocol.text_message(protocol.ROLE_USER, safe_message,
+                                         context_id=envelope.conversation_id if envelope is not None else ctx,
+                                         message_id=envelope.message_id if envelope is not None else "")
     wire_message_id = str(wire_message.get("messageId") or "")
     rpc_body = {"jsonrpc": "2.0", "id": protocol.new_task_id(), "method": "SendMessage",
                 "params": {"message": wire_message}}
@@ -147,8 +149,10 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str,
         receipt = (payload.get("metadata") or {}).get("thread_admission") if isinstance(payload, dict) else None
         if not (isinstance(receipt, dict) and receipt.get("message_id") == envelope.message_id
                 and receipt.get("envelope_digest") == envelope.digest
+                and receipt.get("wire_message_id") == envelope.message_id
+                and receipt.get("wire_context_id") == envelope.conversation_id
                 and receipt.get("status") in {"admitted", "queued", "duplicate"}):
-            raise RuntimeError("admission_unbelegt: recipient did not durably admit the message")
+            raise ValueError("a2a_id_unbelegt: recipient did not bind the wire ids")
         if admission_sink is not None:
             admission_sink.update(receipt)
     if envelope is None:
@@ -273,8 +277,12 @@ def _conversational_call(label: str, peer: dict, message: str, calling_agent: An
             return
         box.update(reply=reply, state=state)
 
+    from tools.bot_thread_sync import new_message_id
+    attester = getattr(capability, "attest", None)
+    if callable(attester):
+        attester("a2a_ids")
     result = capability.send(target=label, message=message, transport="a2a", peer_thread=thread, wire_transport=wire,
-                             recipient=peer.get("profile") or label)
+                             recipient=peer.get("profile") or label, message_id=new_message_id())
     if result.status != "sent":
         return f"[{label} · {result.status}] {result.reason}"
     if box.get("error"):

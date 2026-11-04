@@ -199,6 +199,37 @@ def _norm(thread: dict[str, Any]) -> dict[str, str]:
 
 
 RUNTIME_INSTANCE = uuid.uuid4().hex  # non-secret process identity; authority lives in tools.bot_thread_authority
+_uuid7_lock = threading.Lock()
+_uuid7_last_ms = -1
+_uuid7_last_random = -1
+
+
+def new_message_id() -> str:
+    """Return a monotonic RFC 9562 UUIDv7 for a sender-owned message envelope."""
+    global _uuid7_last_ms, _uuid7_last_random
+    with _uuid7_lock:
+        milliseconds = time.time_ns() // 1_000_000
+        if milliseconds < _uuid7_last_ms:
+            milliseconds = _uuid7_last_ms
+        random_bits = _secrets.randbits(74)
+        if milliseconds == _uuid7_last_ms and random_bits <= _uuid7_last_random:
+            random_bits = _uuid7_last_random + 1
+        if random_bits >= (1 << 74):
+            milliseconds += 1
+            random_bits = _secrets.randbits(74)
+        _uuid7_last_ms, _uuid7_last_random = milliseconds, random_bits
+    value = ((milliseconds & ((1 << 48) - 1)) << 80) | (7 << 76)
+    value |= ((random_bits >> 62) & 0xFFF) << 64
+    value |= 0x8000000000000000 | (random_bits & ((1 << 62) - 1))
+    return str(uuid.UUID(int=value))
+
+
+def _valid_message_id(value: Any) -> bool:
+    try:
+        parsed = uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return parsed.version == 7 and parsed.variant == uuid.RFC_4122 and str(parsed) == str(value).lower()
 
 
 @dataclass(frozen=True)
@@ -365,6 +396,7 @@ SEAMS: dict[str, tuple[str, str]] = {
     "provider_binding": ("tools/bot_thread_provider.py", "def build_thread_sync"),
     "tenant": ("gateway/run_thread_context.py", "def build_thread_auth_context"),
     "a2a_admission": ("plugins/platforms/a2a/adapter.py", "def _receive_thread_sync"),
+    "a2a_ids": ("plugins/platforms/a2a/tools.py", "def _send_task"),
     "owner_lease": ("tools/bot_thread_provider.py", "def _active_owner"),
     "egress": ("tools/bot_thread_provider.py", "def _project"),
     "sender_edit": ("tools/bot_thread_provider.py", "def _edit_projection"),
@@ -1288,6 +1320,8 @@ class OutboundStateMachine(_Machine):
         reason = self._gate(event, "provider_binding", "tenant", "egress", "sender_edit", "audit")
         if reason:
             return self._block(event, reason)
+        if event.transport == "a2a" and not self.sync.evidence.proven("a2a_ids"):
+            return SyncResult("blocked", "a2a_id_unbelegt", message_id=event.message_id)
         if _norm(event.source_thread) != _norm(ctx.thread):
             return self._block(event, "owner_abweichend")
         try:

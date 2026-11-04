@@ -1312,7 +1312,8 @@ def test_conversational_message_agent_uses_capability_and_ignores_model_identity
     result = json.loads(bot_mode_dm.message_agent_tool(target="researcher", message="hello", agent=agent))
     assert result["status"] == "sent"
     assert calls[0]["target"] == "researcher" and calls[0]["art"] == "gespraech"
-    assert not ({"tenant", "message_id", "conversation_id", "source_thread", "target_thread"} & set(calls[0]))
+    assert not ({"tenant", "conversation_id", "source_thread", "target_thread"} & set(calls[0]))
+    assert __import__("uuid").UUID(calls[0]["message_id"]).version == 7
 
 
 def test_conversational_message_agent_without_capability_fails_closed_and_never_uses_bot_chat(tmp_path):

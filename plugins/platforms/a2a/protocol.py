@@ -132,9 +132,9 @@ def text_part(text: str) -> dict:
     return {"text": text, "mediaType": "text/plain"}
 
 
-def text_message(role: str, text: str, context_id: str = "") -> dict:
+def text_message(role: str, text: str, context_id: str = "", message_id: str = "") -> dict:
     """A2A v1.0 Message with a single text Part."""
-    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": uuid.uuid4().hex}
+    msg: dict[str, Any] = {"role": role, "parts": [text_part(text)], "messageId": message_id or uuid.uuid4().hex}
     if context_id:
         msg["contextId"] = context_id
     return msg

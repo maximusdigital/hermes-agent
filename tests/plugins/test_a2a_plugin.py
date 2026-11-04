@@ -1726,7 +1726,7 @@ class TestConversationalAdmissionAndTransport:
         from tools.bot_thread_sync import mask_text
         m = mask_text(text)
         env = envelope(text=m.text, masking=m.proof(), tenant="tenant-1", tenant_source="x")
-        return {"message": protocol.text_message(protocol.ROLE_USER, m.text, context_id=env.conversation_id),
+        return {"message": protocol.text_message(protocol.ROLE_USER, m.text, context_id=env.conversation_id, message_id=env.message_id),
                 "thread_contract": env.to_wire()}
 
     def _spy(self, monkeypatch):
@@ -2081,7 +2081,9 @@ class TestConversationalAdmissionAndTransport:
         params = self._params()
         digest = params["thread_contract"]["envelope_digest"]
         _, pending = w.adapter._prepare_task(params, "peer")
-        assert pending["admission"] == {"message_id": "msg-1", "envelope_digest": digest, "status": "admitted"}
+        assert pending["admission"] == {"message_id": "msg-1", "envelope_digest": digest,
+                                         "wire_message_id": "msg-1", "wire_context_id": "conv-1",
+                                         "status": "admitted"}
         w.complete()
         replay, _ = w.adapter._prepare_task(params, "peer")
         assert replay["metadata"]["thread_admission"]["status"] == "duplicate"
@@ -2134,7 +2136,9 @@ class TestConversationalAdmissionAndTransport:
             captured["params"] = body["params"]
             ctx = body["params"]["message"]["contextId"]
             wire = body["params"]["thread_contract"]
-            receipt = {"message_id": wire["message_id"], "envelope_digest": wire["envelope_digest"], "status": "admitted"}
+            receipt = {"message_id": wire["message_id"], "envelope_digest": wire["envelope_digest"],
+                       "wire_message_id": captured["params"]["message"]["messageId"],
+                       "wire_context_id": ctx, "status": "admitted"}
             task = protocol.build_task("t", ctx, protocol.STATE_COMPLETED, "PONG",
                                        metadata={**(metadata or {}), "thread_admission": receipt})
             return protocol.jsonrpc_result(body["id"], task)

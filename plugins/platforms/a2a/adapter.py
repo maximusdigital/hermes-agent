@@ -640,6 +640,11 @@ class A2AAdapter(BasePlatformAdapter):
         wire = params.get("thread_contract")
         if not isinstance(wire, dict) or wire.get("text") != text or wire.get("transport") != "a2a":
             raise RuntimeError("envelope_ungueltig: complete thread_contract required")
+        message = params.get("message") or {}
+        wire_message_id = message.get("messageId") if isinstance(message, dict) else None
+        wire_context_id = message.get("contextId") if isinstance(message, dict) else None
+        if wire_message_id != wire.get("message_id") or wire_context_id != wire.get("conversation_id"):
+            raise RuntimeError("a2a_id_unbelegt: wire ids do not match thread_contract")
         # The peer was authenticated by this adapter's inbound security layer to reach here.
         capability.attest("a2a_admission")
         return capability.receive_wire(wire, peer=peer, external_dispatch=True)
@@ -673,7 +678,9 @@ class A2AAdapter(BasePlatformAdapter):
             try:
                 admission = self._receive_thread_sync(params, text, peer=peer, agent=agent)
                 wire = params["thread_contract"]
-                receipt = {"message_id": wire.get("message_id"), "envelope_digest": wire.get("envelope_digest")}
+                receipt = {"message_id": wire.get("message_id"), "envelope_digest": wire.get("envelope_digest"),
+                           "wire_message_id": params["message"].get("messageId"),
+                           "wire_context_id": params["message"].get("contextId")}
                 if admission.status == "duplicate":
                     # Replay of a COMPLETED message: no model run. If its reply is durable, hand the
                     # sender that reply contract (it validates + projects it once); else just duplicate.
