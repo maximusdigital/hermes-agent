@@ -745,6 +745,28 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     return last_result
 
 
+async def _edit_platform_message(platform, chat_id, message_id, content, *, thread_id=None):
+    """Edit through the live gateway adapter only; this capability never falls back to a new send."""
+    runner, adapter = _live_adapter(platform)
+    if adapter is None or not callable(getattr(adapter, "edit_message", None)):
+        return {"success": False, "error": "Not supported"}
+    metadata = {"thread_id": thread_id} if thread_id else None
+    try:
+        result = await _dispatch_on_gateway_loop(
+            runner, lambda: adapter.edit_message(str(chat_id), str(message_id), content, metadata=metadata),
+            "send_message: failed to schedule edit on gateway loop")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return {"success": False, "error": _bounded_send_error(exc)}
+    if isinstance(result, dict):
+        return {"success": bool(result.get("success")), "message_id": result.get("message_id") or str(message_id),
+                "error": result.get("error")}
+    return {"success": bool(getattr(result, "success", False)),
+            "message_id": getattr(result, "message_id", None) or str(message_id),
+            "error": getattr(result, "error", None)}
+
+
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
 # Names external plugins imported from this module before the Sep 2026 decomposition.
 # Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).

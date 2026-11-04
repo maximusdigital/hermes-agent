@@ -281,6 +281,7 @@ class ThreadEnvelope:
     projection_requested: bool = False
     is_root: bool | None = None
     status: str = "eingereiht"
+    spiegel: bool = False
     masking: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -302,6 +303,8 @@ class ThreadEnvelope:
             raise ValueError("text too large")
         if self.art not in {"gespraech", "arbeitsauftrag"}:
             raise ValueError("invalid art")
+        if not isinstance(self.spiegel, bool):
+            raise ValueError("spiegel must be boolean")
         if self.tenant is not None and not self.tenant_source:
             raise ValueError("tenant_source is required with tenant")
         if self.masking:  # schema-close at EVERY construction (wire, payload, storage): canonical or rejected
@@ -364,6 +367,7 @@ SEAMS: dict[str, tuple[str, str]] = {
     "a2a_admission": ("plugins/platforms/a2a/adapter.py", "def _receive_thread_sync"),
     "owner_lease": ("tools/bot_thread_provider.py", "def _active_owner"),
     "egress": ("tools/bot_thread_provider.py", "def _project"),
+    "sender_edit": ("tools/bot_thread_provider.py", "def _edit_projection"),
     "audit": ("tools/bot_thread_sync.py", "def _audit"),
 }
 
@@ -1116,7 +1120,8 @@ class _Machine:
             "kind": "audit", "conversation_id": event.conversation_id, "message_id": event.message_id,
             "parent_message_id": event.parent_message_id, "sender": event.sender, "recipient": event.recipient,
             "tenant": event.tenant, "tenant_source": event.tenant_source, "transport": event.transport,
-            "status": status, "reason": reason, "match_count": event.masking.get("match_count", 0),
+            "spiegel": event.spiegel, "status": status, "reason": reason,
+            "match_count": event.masking.get("match_count", 0),
             "scanner_version": event.masking.get("scanner_version", SCANNER_VERSION),
         })
 
@@ -1206,14 +1211,60 @@ class OutboundStateMachine(_Machine):
         return min(BACKOFF_CAP_SECONDS, 5 * (2 ** max(0, attempts - 1)))
 
     def _failed_status(self, event: ThreadEnvelope, reason: str) -> None:
-        """Visible sender-side status for a dead letter; carries no message text."""
+        """A terminal status only edits the original sender projection, never sends a follow-up."""
+        result = self.update_status(event, "fehlgeschlagen", reason=reason)
+        # If the initial projection itself never reached the platform, there is no entry to edit.
+        # One terminal error projection is then the sole visible entry; once a reference exists, the
+        # branch above is the only path and no follow-up can be emitted.
+        existing = self.sync.journal.events(event.conversation_id)
+        has_projection = any(row.get("message_id") == event.message_id and row.get("sender_projection")
+                             for row in existing)
+        if result.status != "unvollständig" or has_projection:
+            return
         owner, bad = self._owner(event.source_thread)
         if owner is None or bad or self.sync.sender_project is None:
             return
-        payload = {**asdict(event), "text": f"Zustellung fehlgeschlagen ({reason}).", "status": "fehlgeschlagen",
-                   "egress_key": egress_key(event.conversation_id, event.message_id, "status", event.source_thread)}
+        payload = {**asdict(event), "spiegel": True, "text": f"Zustellung fehlgeschlagen ({reason}).",
+                   "status": "fehlgeschlagen", "egress_key": egress_key(event.conversation_id, event.message_id,
+                                                                            "status", event.source_thread)}
         with contextlib.suppress(Exception):
             self._stage(event, "status", lambda: self.sync.sender_project(owner, payload))
+
+    def update_status(self, event: ThreadEnvelope, status: str, *, reason: str = "") -> SyncResult:
+        """Edit the first sender projection for this message, with a separately idempotent egress key."""
+        if status not in {"empfangen", "beantwortet", "fehlgeschlagen"}:
+            return SyncResult("unvollständig", "status_unzulaessig", message_id=event.message_id)
+        existing = self.sync.journal.events(event.conversation_id)
+        projection = next((row for row in reversed(existing)
+                           if row.get("message_id") == event.message_id and row.get("sender_projection")), None)
+        reference = str((projection or {}).get("sender_projection") or "")
+        owner, bad = self._owner(event.source_thread)
+        if not reference or owner is None or bad or self.sync.sender_edit is None:
+            self._audit(event, "unvollständig", "bearbeiten_nicht_unterstuetzt")
+            return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
+        text = (f"Zustellung fehlgeschlagen ({reason})." if status == "fehlgeschlagen"
+                else f"Status: {status}.")
+        payload = {**asdict(event), "spiegel": True, "text": text, "status": status,
+                   "egress_key": egress_key(event.conversation_id, event.message_id,
+                                             f"sender_edit:{status}", event.source_thread)}
+        try:
+            def edit() -> str:
+                result = self.sync.sender_edit(owner, reference, payload)
+                if not isinstance(result, dict) or not result.get("success"):
+                    raise RuntimeError("bearbeiten_nicht_unterstuetzt")
+                return reference
+            state, _ = self._stage(event, f"sender_edit:{status}", edit)
+        except Exception:
+            self._audit(event, "unvollständig", "bearbeiten_nicht_unterstuetzt")
+            return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
+        if state != "done":
+            return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
+        self.sync.journal.append_once(event.conversation_id, {
+            "kind": "sender_status", "conversation_id": event.conversation_id, "message_id": event.message_id,
+            "sender_projection": reference, "spiegel": True, "status": status, "reason": reason,
+        })
+        self._audit(event, status, reason)
+        return SyncResult(status, reason, message_id=event.message_id)
 
     def dead_letter(self, event: ThreadEnvelope, reason: str, attempts: int) -> SyncResult:
         self.sync.journal.append(event.conversation_id, {
@@ -1234,7 +1285,7 @@ class OutboundStateMachine(_Machine):
         ctx = self.sync.auth
         if event.tenant is None:  # authority is the authenticated context, never the message
             event = ThreadEnvelope(**{**asdict(event), "tenant": ctx.tenant, "tenant_source": "gateway_context"})
-        reason = self._gate(event, "provider_binding", "tenant", "egress", "audit")
+        reason = self._gate(event, "provider_binding", "tenant", "egress", "sender_edit", "audit")
         if reason:
             return self._block(event, reason)
         if _norm(event.source_thread) != _norm(ctx.thread):
@@ -1267,9 +1318,10 @@ class OutboundStateMachine(_Machine):
         if not self.sync.attest("owner_lease"):
             return self._block(event, "spiegel_unbelegt")
         payload = {**asdict(event), "status": "gesendet"}
+        sender_payload = {**payload, "spiegel": True}
         try:
             state, ref = self._stage(event, "sender_projection", lambda: self.sync.sender_project(
-                owner, {**payload, "egress_key": egress_key(event.conversation_id, event.message_id,
+                owner, {**sender_payload, "egress_key": egress_key(event.conversation_id, event.message_id,
                                                             "sender_projection", event.source_thread)}))
             if state == "busy":
                 return SyncResult("queued", "in_bearbeitung", message_id=event.message_id)
@@ -1278,7 +1330,7 @@ class OutboundStateMachine(_Machine):
                 return self.dead_letter_silent(event, "ausgang_unbestaetigt")
             self.sync.journal.append(event.conversation_id, {
                 "kind": "projection", "conversation_id": event.conversation_id, "message_id": event.message_id,
-                "sender_projection": ref, "status": "gesendet", "masking": event.masking})
+                "sender_projection": ref, "spiegel": True, "status": "gesendet", "masking": event.masking})
             if self.sync.transport is not None:
                 state, _ = self._stage(event, "transport", lambda: self.sync.transport(payload) and "" or "ok",
                                        resend_safe=True)
@@ -1294,7 +1346,7 @@ class OutboundStateMachine(_Machine):
             return SyncResult("queued", reason, attempts, event.message_id)
         self.sync.journal.append_once(event.conversation_id, {
             "kind": "outbound_done", "conversation_id": event.conversation_id, "message_id": event.message_id,
-            "status": "gesendet", "sender_projection": ref, "masking": event.masking})
+            "spiegel": True, "status": "gesendet", "sender_projection": ref, "masking": event.masking})
         self._audit(event, "sent")
         return SyncResult("sent", message_id=event.message_id)
 
@@ -1325,6 +1377,8 @@ class InboundStateMachine(_Machine):
             proof_ok = False
         if not proof_ok:
             return self._block(event, "maskierung_unbelegt")
+        if event.spiegel:
+            return self._block(event, "spiegel_nicht_ausfuehrbar")
         event, refused = self._canonical(event)  # atomic compare-or-create; continue ONLY with the canonical object
         if refused is not None:
             return refused
@@ -1425,6 +1479,7 @@ class ThreadSync:
     def __init__(self, *, journal: Journal, auth: GatewayAuthContext,
                  owner_resolver: Callable[[dict[str, Any]], Owner | list[Owner] | None],
                  sender_project: Callable[[Owner, dict[str, Any]], str] | None = None,
+                 sender_edit: Callable[[Owner, str, dict[str, Any]], dict[str, Any]] | None = None,
                  project: Callable[[Owner, dict[str, Any]], str] | None = None,
                  transport: Callable[[dict[str, Any]], Any] | None = None,
                  secrets: Iterable[str] = (), secrets_provider: Callable[[], Iterable[str]] | None = None,
@@ -1436,7 +1491,7 @@ class ThreadSync:
                  dispatch_gate: Callable[[ThreadEnvelope], Any] | None = None,
                  authority: Callable[[], bool] | None = None):
         self.journal, self.auth, self.owner_resolver = journal, auth, owner_resolver
-        self.sender_project, self.project, self.transport = sender_project, project, transport
+        self.sender_project, self.sender_edit, self.project, self.transport = sender_project, sender_edit, project, transport
         self._secrets, self._secrets_provider = tuple(secrets), secrets_provider
         self.pre_session_hook, self.process, self.clock = pre_session_hook, process, clock
         # Gateway hand-off for externally dispatched messages recovered from the queue (no live request).
@@ -1467,6 +1522,12 @@ class ThreadSync:
     def receive(self, envelope: ThreadEnvelope, *, external_dispatch: bool = False) -> SyncResult:
         try:
             return self.inbound.receive(envelope, external_dispatch=external_dispatch)
+        except AuthorityLost:
+            return SyncResult("blocked", "autoritaet_widerrufen", message_id=envelope.message_id)
+
+    def update_status(self, envelope: ThreadEnvelope, status: str, *, reason: str = "") -> SyncResult:
+        try:
+            return self.outbound.update_status(envelope, status, reason=reason)
         except AuthorityLost:
             return SyncResult("blocked", "autoritaet_widerrufen", message_id=envelope.message_id)
 

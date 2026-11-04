@@ -132,6 +132,23 @@ def _send_canonical_thread_message(owner: dict[str, Any], message: str) -> dict[
     return result
 
 
+def _edit_canonical_thread_message(owner: dict[str, Any], message_id: str, message: str) -> dict[str, Any]:
+    """Edit via the live gateway adapter. Unsupported edits remain a terminal false result."""
+    from gateway.config import Platform
+    from model_tools import _run_async
+    from tools.send_message_tool import _edit_platform_message
+    from tools.bot_thread_sync import mask_text
+
+    masked = mask_text(message)
+    try:
+        platform = Platform(str(owner.get("platform") or "").lower())
+    except ValueError:
+        return {"success": False, "error": "Not supported"}
+    result = _run_async(_edit_platform_message(
+        platform, str(owner["chat_id"]), str(message_id), masked.text, thread_id=owner.get("thread_id")))
+    return result if isinstance(result, dict) else {"success": False, "error": "Not supported"}
+
+
 def _owner(home: Path | str, owner: dict[str, Any]) -> dict[str, str]:
     pinned = {key: owner.get(key) for key in _OWNER_KEYS}
     if not all(isinstance(value, str) and value for value in pinned.values()):

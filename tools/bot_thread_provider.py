@@ -84,6 +84,33 @@ def _project(owner: Owner, payload: dict[str, Any], gate: Any = None) -> str:
             os.close(fd)
 
 
+def _edit_projection(owner: Owner, message_id: str, payload: dict[str, Any], gate: Any = None) -> dict[str, Any]:
+    """Edit the initial projection through the gateway; an unsupported edit is never a send fallback."""
+    from tools.bot_live_delivery import _edit_canonical_thread_message
+    key = str(payload.get("egress_key") or "")
+    if len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+        raise RuntimeError("egress_key_missing")
+    gate = gate or contextlib.nullcontext
+    with gate():
+        fd = pinned_fs.open_chain(owner.profile_home, EGRESS_PARTS)
+        try:
+            if not pinned_fs.write_atomic(fd, f"{key}.intent", b"1"):
+                try:
+                    return {"success": True, "message_id": str(json.loads(pinned_fs.read_bytes(fd, f"{key}.done"))["ref"])}
+                except ValueError:
+                    raise RuntimeError("egress_ambiguous")
+            result = _edit_canonical_thread_message(
+                {"platform": owner.platform, "chat_id": owner.chat_id, "thread_id": owner.thread_id},
+                message_id, _render(payload))
+            if not result.get("success"):
+                os.unlink(f"{key}.intent", dir_fd=fd)
+                return {"success": False, "error": "Not supported"}
+            pinned_fs.write_atomic(fd, f"{key}.done", json.dumps({"ref": message_id}).encode())
+            return {"success": True, "message_id": message_id}
+        finally:
+            os.close(fd)
+
+
 def _egress_ready() -> bool:
     try:
         from gateway.config import Platform, load_gateway_config
@@ -678,6 +705,7 @@ def default_callbacks() -> dict[str, Any]:
     """Concrete owner / egress / egress-readiness callbacks the gateway runner binds into every grant."""
     return {"owner_resolver": lambda ctx, thread: _active_owner(ctx, thread),
             "egress": lambda owner, payload, gate=None: _project(owner, payload, gate),
+            "egress_edit": lambda owner, message_id, payload, gate=None: _edit_projection(owner, message_id, payload, gate),
             "egress_ready": lambda: _egress_ready()}
 
 
@@ -736,6 +764,14 @@ def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
         with broker.operation(grant, defer_revoke=True):
             return cbs["egress"](owner, payload, commit_gate)
 
+    def guarded_egress_edit(owner, message_id, payload):
+        check()
+        with broker.operation(grant, defer_revoke=True):
+            callback = cbs.get("egress_edit")
+            if callback is None:
+                return {"success": False, "error": "Not supported"}
+            return callback(owner, message_id, payload, commit_gate)
+
     def owner_now(thread):
         owner = cbs["owner_resolver"](ctx, thread) if live() else None
         return owner if live() else None
@@ -760,7 +796,8 @@ def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
     sync = ThreadSync(
         journal=journal, auth=ctx,
         owner_resolver=owner_now,
-        sender_project=guarded_egress, project=guarded_egress, transport=transport, authority=live,
+        sender_project=guarded_egress, sender_edit=guarded_egress_edit, project=guarded_egress,
+        transport=transport, authority=live,
         secrets_provider=secrets_now, evidence=evidence,
         dispatchers={"a2a": guarded_dispatcher(dispatcher)} if dispatcher is not None else {},
         dispatch_gate=lambda event: broker.operation(grant, defer_revoke=True)
@@ -820,4 +857,6 @@ def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
         sync.attest("audit")
     if cbs["egress_ready"]():
         sync.attest("egress")
+        if callable(cbs.get("egress_edit")):
+            sync.attest("sender_edit")
     return capability
