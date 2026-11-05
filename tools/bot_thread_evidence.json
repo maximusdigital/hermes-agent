@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+  "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
   "entries": {
     "message_agent": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_mode_dm.py:64",
       "file": "tools/bot_mode_dm.py",
@@ -14,7 +14,7 @@
     },
     "provider_binding": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:753",
       "file": "tools/bot_thread_provider.py",
@@ -24,7 +24,7 @@
     },
     "tenant": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "gateway/run_thread_context.py:63",
       "file": "gateway/run_thread_context.py",
@@ -34,7 +34,7 @@
     },
     "a2a_admission": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "plugins/platforms/a2a/adapter.py:634",
       "file": "plugins/platforms/a2a/adapter.py",
@@ -44,7 +44,7 @@
     },
     "a2a_ids": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "plugins/platforms/a2a/tools.py:98",
       "file": "plugins/platforms/a2a/tools.py",
@@ -54,7 +54,7 @@
     },
     "a2a_ablage": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "plugins/platforms/a2a/protocol.py:441",
       "file": "plugins/platforms/a2a/protocol.py",
@@ -64,7 +64,7 @@
     },
     "owner_lease": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:32",
       "file": "tools/bot_thread_provider.py",
@@ -74,7 +74,7 @@
     },
     "egress": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:55",
       "file": "tools/bot_thread_provider.py",
@@ -84,7 +84,7 @@
     },
     "pre_session_hook": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:743",
       "file": "tools/bot_thread_provider.py",
@@ -94,7 +94,7 @@
     },
     "sender_edit": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:88",
       "file": "tools/bot_thread_provider.py",
@@ -104,13 +104,13 @@
     },
     "audit": {
       "proven": true,
-      "revision": "artifact:3a766ce0ecaa6473cb2e465633927538b2ba2f3b87c01823bb5f2db939988346",
+      "revision": "artifact:788d2b148b39b57ba9c8f54472a8a68a08f02d978d1be49ccef9407712246161",
       "kind": "Code",
       "location": "tools/bot_thread_sync.py:429",
       "file": "tools/bot_thread_sync.py",
       "line": 429,
       "seam": "def _audit",
-      "sha256": "20519ada88cd5e40c4906a17fb0db031a7d8ed16a713fea74fd8838852951389"
+      "sha256": "d57936dbb1fd79e6444c3c86f08d06c372ccbe587668754885f0d3a6c643f7dd"
     }
   }
 }

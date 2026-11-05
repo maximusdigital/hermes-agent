@@ -698,6 +698,11 @@ class Journal:
         """ONE atomic step under the conversation lock + pinned dir_fd: create the authenticated projection
         or compare against the existing one. Returns (CREATED | EXACT_REPLAY | CONFLICT | TAMPERED,
         canonical stored envelope). Callers must continue ONLY with the returned canonical object."""
+        try:
+            if not verify_masking_proof(envelope.text, envelope.masking):
+                return "TAMPERED", None
+        except ValueError:
+            return "TAMPERED", None
         name = f"{_segment(envelope.message_id, 'message_id')}.json"
         body = asdict(envelope)
         scope = f"projection|{envelope.conversation_id}|{envelope.message_id}"
@@ -1300,6 +1305,11 @@ class OutboundStateMachine(_Machine):
         reference = str((projection or {}).get("sender_projection") or "")
         owner, bad = self._owner(event.source_thread)
         if not reference or owner is None or bad or self.sync.sender_edit is None:
+            self.sync.journal.append_once(event.conversation_id, {
+                "kind": "sender_status", "conversation_id": event.conversation_id,
+                "message_id": event.message_id, "spiegel": True, "status": status,
+                "unvollstaendig": True,
+            })
             self._audit(event, "unvollständig", "bearbeiten_nicht_unterstuetzt")
             return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
         text = (f"Zustellung fehlgeschlagen ({reason})." if status == "fehlgeschlagen"
@@ -1315,9 +1325,19 @@ class OutboundStateMachine(_Machine):
                 return reference
             state, _ = self._stage(event, f"sender_edit:{status}", edit)
         except Exception:
+            self.sync.journal.append_once(event.conversation_id, {
+                "kind": "sender_status", "conversation_id": event.conversation_id,
+                "message_id": event.message_id, "spiegel": True, "status": status,
+                "unvollstaendig": True,
+            })
             self._audit(event, "unvollständig", "bearbeiten_nicht_unterstuetzt")
             return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
         if state != "done":
+            self.sync.journal.append_once(event.conversation_id, {
+                "kind": "sender_status", "conversation_id": event.conversation_id,
+                "message_id": event.message_id, "spiegel": True, "status": status,
+                "unvollstaendig": True,
+            })
             return SyncResult("unvollständig", "bearbeiten_nicht_unterstuetzt", message_id=event.message_id)
         self.sync.journal.append_once(event.conversation_id, {
             "kind": "sender_status", "conversation_id": event.conversation_id, "message_id": event.message_id,
@@ -1348,6 +1368,8 @@ class OutboundStateMachine(_Machine):
         reason = self._gate(event, "provider_binding", "tenant", "egress", "sender_edit", "audit")
         if reason:
             return self._block(event, reason)
+        if not self.sync.evidence.proven("pre_session_hook"):
+            return self._block(event, "sitzung_unmaskiert")
         if not self.sync.journal.verify_writable():
             return SyncResult("blocked", "audit_fehler", message_id=event.message_id)
         if event.transport == "a2a":
@@ -1360,6 +1382,8 @@ class OutboundStateMachine(_Machine):
         try:
             if not canonical:  # a stored canonical envelope is already masked + authenticated
                 event = self._masked(event)
+            if not verify_masking_proof(event.text, event.masking, secrets=self.sync.current_secrets()):
+                return self._block(event, "maskierung_unbelegt")
         except Exception:
             return self._block(event, "scan_fehler")
         if self.sync.sender_project is None:
@@ -1402,6 +1426,7 @@ class OutboundStateMachine(_Machine):
                 return self.dead_letter_silent(event, "ausgang_unbestaetigt")
             self.sync.journal.append(event.conversation_id, {
                 "kind": "projection", "conversation_id": event.conversation_id, "message_id": event.message_id,
+                "parent_message_id": event.parent_message_id,
                 "sender_projection": ref, "spiegel": True, "status": "gesendet", "masking": event.masking})
             if self.sync.transport is not None:
                 state, _ = self._stage(event, "transport", lambda: self.sync.transport(payload) and "" or "ok",
@@ -1472,6 +1497,8 @@ class InboundStateMachine(_Machine):
             return SyncResult("queued", reason, message_id=event.message_id)
         if self.sync.project is None or not self.sync.attest("owner_lease"):
             return self._block(event, "spiegel_unbelegt")
+        if self.sync.pre_session_hook is None:
+            return self._block(event, "sitzung_unmaskiert")
         payload = {**asdict(event), "status": "empfangen"}
         try:
             state, ref = self._stage(event, "recipient_projection", lambda: self.sync.project(
@@ -1481,8 +1508,6 @@ class InboundStateMachine(_Machine):
                 return SyncResult("queued", "in_bearbeitung", message_id=event.message_id)
             if state == "ambiguous":
                 return self._block(event, "eingangsprojektion_unbestatigt")
-            if self.sync.pre_session_hook is None:
-                return self._block(event, "sitzung_unmaskiert")
             if True:  # atomic: exactly one receipt per message even for concurrent exact replays
                 self.sync.journal.append_once(event.conversation_id, {
                     "kind": "inbound_receipt", "conversation_id": event.conversation_id,
