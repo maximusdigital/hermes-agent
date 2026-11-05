@@ -44,6 +44,7 @@ def make_sync(tmp_path, ctx=None, *, name="a", attest=ATTEST, **kw):
     ctx = ctx or make_ctx(home)
     kw.setdefault("owner_resolver", lambda thread: owner_for(ctx) if thread.get("thread_id") == ctx.thread["thread_id"] else None)
     kw.setdefault("evidence", registry())
+    kw.setdefault("pre_session_hook", lambda _payload: True)
     sync = ThreadSync(journal=Journal(home / "journal", trusted_base=home), auth=ctx, **kw)
     if attest:
         sync.attest(*attest)
