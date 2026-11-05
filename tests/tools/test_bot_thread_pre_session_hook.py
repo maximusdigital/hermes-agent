@@ -25,7 +25,7 @@ def test_inbound_without_pre_session_hook_blocks_before_projection_or_processing
     result = sync.receive(_incoming())
 
     assert (result.status, result.reason) == ("blocked", "sitzung_unmaskiert")
-    assert len(projected) == 1 and dispatched == []
+    assert len(projected) == 0 and dispatched == []
     assert not [row for row in sync.journal.events("conv-1") if row["kind"] == "inbound_processed"]
 
 

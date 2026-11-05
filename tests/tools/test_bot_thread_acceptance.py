@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import pytest
+from pathlib import Path
 
 from tests.tools.bot_thread_support import envelope, make_sync
 from tools.bot_thread_sync import (
@@ -10,6 +11,7 @@ from tools.bot_thread_sync import (
     TTL_SECONDS,
     EvidenceRegistry,
     OutboundStateMachine,
+    build_evidence_entries,
 )
 
 pytest_plugins = ("tests.tools.test_bot_thread_provider",)
@@ -47,11 +49,14 @@ def test_a2_invalid_target_thread_is_audited_as_contract_breach(world):
 
 
 def test_t8_doku_registry_entry_is_never_proven():
-    evidence = EvidenceRegistry("rev", {"adapter": {"proven": True, "revision": "rev", "kind": "Doku",
-                                                       "file": "tools/bot_thread_sync.py", "line": 1,
-                                                       "seam": "x", "sha256": "0" * 64}})
+    root = Path(__file__).resolve().parents[2]
+    entries = build_evidence_entries(root, "rev")
+    evidence = EvidenceRegistry("rev", entries, repo_root=root)
     evidence.bind(instance="i", owner_token="o", turn="t")
-    assert evidence.proven("adapter") is False
+    assert evidence.attest("audit") is True
+    assert evidence.proven("audit") is True
+    entries["audit"]["kind"] = "Doku"
+    assert evidence.proven("audit") is False
 
 
 def test_t11_two_transports_keep_the_same_conversation_and_distinct_transport_rows(world):
@@ -127,6 +132,10 @@ def _t10_roundtrip(world, monkeypatch):
     a2 = world.cap("neo")
     a2._sync.clock = lambda: time.time() + 120
     assert a2.recover() >= 1
+    a2a.a2a_call({"agent": "r", "message": "folgefrage"},
+                 agent=SimpleNamespace(_thread_sync_capability=a2))
+    b._sync.clock = lambda: time.time() + 150
+    assert b.recover() >= 1
     return a2, b, conversation_id, question
 
 
@@ -149,9 +158,14 @@ def test_t10_a2a_roundtrip_reply_keeps_question_parent(world, monkeypatch):
 
 
 def test_t10_a2a_roundtrip_projects_each_message_once_per_side(world, monkeypatch):
-    a2, b, conversation_id, _question = _t10_roundtrip(world, monkeypatch)
+    a2, b, conversation_id, question = _t10_roundtrip(world, monkeypatch)
     for capability in (a2, b):
         rows = [event for event in capability._sync.journal.events(conversation_id)
                 if event.get("kind") in {"projection", "inbound_receipt"}
                 and (event.get("sender_projection") or event.get("recipient_projection"))]
-        assert len(rows) == 2 and len({event["message_id"] for event in rows}) == 2
+        assert len(rows) == 3 and len({event["message_id"] for event in rows}) == 3
+    reply = next(event for event in a2._sync.journal.events(conversation_id)
+                 if event.get("kind") == "inbound_receipt" and event["message_id"] != question.message_id)
+    follow_up = next(event for event in a2._sync.journal.events(conversation_id)
+                     if event.get("kind") == "projection" and event["message_id"] != question.message_id)
+    assert follow_up["parent_message_id"] == reply["message_id"]

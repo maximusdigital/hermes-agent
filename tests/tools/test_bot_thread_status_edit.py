@@ -69,6 +69,12 @@ def test_unsupported_status_edit_is_unvollstaendig_and_never_follows_up(tmp_path
     assert (result.status, result.reason) == ("unvollständig", "bearbeiten_nicht_unterstuetzt")
     assert len(egress.sends) == 1
     assert len(egress.edits) == 1
+    rows = sync.journal.events(event.conversation_id)
+    status = [row for row in rows if row.get("kind") == "sender_status"]
+    assert [{key: row[key] for key in ("kind", "conversation_id", "message_id", "spiegel", "status", "unvollstaendig")}
+            for row in status] == [{"kind": "sender_status", "conversation_id": event.conversation_id,
+                                    "message_id": event.message_id, "spiegel": True,
+                                    "status": "empfangen", "unvollstaendig": True}]
 
 
 def test_spiegel_marker_blocks_dispatch_but_unmarked_conversation_is_processed(tmp_path):

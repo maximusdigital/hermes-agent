@@ -56,6 +56,28 @@ def test_proof_binds_digest_version_and_spans():
     assert not verify_masking_proof(m.text, {**proof, "scanner_version": "old"})
 
 
+def test_outbound_raw_canonical_envelope_blocks_before_sender_projection(tmp_path):
+    projected = []
+    sync = make_sync(tmp_path, sender_project=lambda _owner, payload: projected.append(payload) or "entry")
+
+    result = sync.outbound.send(envelope(), canonical=True)
+
+    assert (result.status, result.reason) == ("blocked", "maskierung_unbelegt")
+    assert projected == []
+
+
+def test_outbound_without_pre_session_hook_blocks_before_projection(tmp_path):
+    projected = []
+    sync = make_sync(tmp_path, pre_session_hook=None,
+                     attest=tuple(name for name in registry().entries if name != "pre_session_hook"),
+                     sender_project=lambda _owner, payload: projected.append(payload) or "entry")
+
+    result = sync.send(envelope())
+
+    assert (result.status, result.reason) == ("blocked", "sitzung_unmaskiert")
+    assert projected == []
+
+
 # ---------------------------------------------------------------- authority
 def test_expired_infinite_or_forged_context_fails_closed(tmp_path):
     now = time.time()

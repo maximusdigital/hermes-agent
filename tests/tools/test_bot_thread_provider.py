@@ -1464,7 +1464,7 @@ def test_outbound_resend_of_the_stored_reply_is_canonical_not_a_conflicting_vari
     result, canonical = j.compare_or_create_projection(first)
     assert result == "EXACT_REPLAY" and canonical.digest == first.digest
     altered = ThreadEnvelope(**{**first.__dict__, "text": "gefaelscht"})
-    assert j.compare_or_create_projection(altered)[0] == "CONFLICT"
+    assert j.compare_or_create_projection(altered)[0] == "TAMPERED"
 
 
 def test_smuggled_masking_field_over_the_network_is_rejected_before_any_side_effect(world):
