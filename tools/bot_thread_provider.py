@@ -239,8 +239,12 @@ class ThreadSyncCapability:
             profile, home, thread = resolved
         if wire_transport is not None:
             self._wire[transport] = wire_transport
+        if transport == "message_agent" and not self._sync.evidence.proven("message_agent"):
+            return SyncResult("blocked", "adapter_unbelegt", message_id=message_id)
         if transport == "a2a" and not self._sync.evidence.proven("a2a_ids"):
             return SyncResult("blocked", "a2a_id_unbelegt", message_id=message_id)
+        if transport == "a2a" and not self._sync.evidence.proven("a2a_ablage"):
+            return SyncResult("blocked", "a2a_ablage_unmaskiert", message_id=message_id)
         conversation_id = conversation_id_for(self._ctx.tenant, self._ctx.profile, profile)
         if not _valid_message_id(message_id):
             return SyncResult("blocked", "envelope_ungueltig")
@@ -279,6 +283,11 @@ class ThreadSyncCapability:
         resolved = _target(Path(self._ctx.profile_home), envelope.sender)
         return bool(resolved and resolved[0] == envelope.sender and _norm_thread(resolved[2]) == claimed)
 
+    def _sender_identity_known(self, envelope: ThreadEnvelope, peer: str | None) -> bool:
+        if envelope.transport == "a2a":
+            return str(peer or "") in self._peers
+        return _target(Path(self._ctx.profile_home), envelope.sender) is not None
+
     @_requires_authority(_blocked)
     @_atomic_authority(_blocked)
     def receive_wire(self, wire: dict, *, peer: str | None = None, external_dispatch: bool = False) -> SyncResult:
@@ -289,6 +298,9 @@ class ThreadSyncCapability:
         if envelope.recipient != self._ctx.profile:  # addressed to someone else: no side effects at all
             return SyncResult("blocked", "empfaenger_abweichend", message_id=envelope.message_id)
         if not self._sender_authenticated(envelope, peer):
+            if self._sender_identity_known(envelope, peer):
+                self._sync.inbound._audit(envelope, "Vertragsbruch", "absender_abweichend")
+                return SyncResult("blocked", "absender_abweichend", message_id=envelope.message_id)
             return SyncResult("blocked", "absender_unbelegt", message_id=envelope.message_id)
         if envelope.transport == "a2a":
             # The authenticated peer's configured tenant must equal BOTH the envelope's and this

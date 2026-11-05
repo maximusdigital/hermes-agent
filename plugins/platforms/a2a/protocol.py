@@ -441,6 +441,8 @@ def _conv_path(context_id: str) -> Path:
 def persist_message(context_id: str, role: str, text: str, task_id: str = "") -> None:
     """Append one message to the context's on-disk conversation log. Never raises."""
     try:
+        from tools.bot_thread_sync import mask_text
+        text = mask_text(text).text
         path = _conv_path(context_id)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as fh:

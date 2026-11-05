@@ -64,6 +64,7 @@ def world(tmp_path, monkeypatch):
         c = prov.build_thread_sync(*ctx, evidence=registry(), dispatcher=dispatcher, native_runner=native_runner,
                                     refresh=refresh)
         assert c is not None
+        c._sync.attest("message_agent", "a2a_ablage")
         import tests.tools.bot_thread_support as _support
         c._sync.clock = lambda: _support.time.time()  # one wall clock for grants AND the engine (tests may skew it)
         return TestCapability(c)
@@ -74,8 +75,10 @@ def world(tmp_path, monkeypatch):
         def send(self, **kwargs):
             from tools.bot_thread_sync import new_message_id
             kwargs.setdefault("message_id", new_message_id())
+            if kwargs.get("transport", "message_agent") == "message_agent":
+                self._inner.attest("message_agent")
             if kwargs.get("transport") == "a2a":
-                self._inner.attest("a2a_ids")
+                self._inner.attest("a2a_ids", "a2a_ablage")
             return self._inner.send(**kwargs)
 
     class W:
@@ -212,7 +215,7 @@ def test_native_forged_sender_is_blocked_before_projection(world, monkeypatch):
     # roster says the sender "neo" lives on another thread than the envelope claims
     monkeypatch.setattr(prov, "_target", lambda root, t: ("neo", world.homes["neo"],
                         {"platform": "telegram", "chat_id": "max", "thread_id": "attacker-t"}))
-    assert [(r.status, r.reason) for r in b.ingest_inbox()] == [("blocked", "absender_unbelegt")]
+    assert [(r.status, r.reason) for r in b.ingest_inbox()] == [("blocked", "absender_abweichend")]
     assert [t for t, _ in world.egress] == ["neo-t"]
 
 
@@ -234,9 +237,9 @@ def test_a2a_peer_must_be_allowlisted_for_sender_profile_and_source_thread(world
     assert b.receive_wire(wire, peer="evil").reason == "absender_unbelegt"      # unknown peer
     assert b.receive_wire(wire).reason == "absender_unbelegt"                    # no peer identity at all
     b._peers["p"] = {**allow, "profile": "someone-else"}
-    assert b.receive_wire(wire, peer="p").reason == "absender_unbelegt"          # wrong profile
+    assert b.receive_wire(wire, peer="p").reason == "absender_abweichend"        # wrong profile
     b._peers["p"] = {**allow, "source_thread": {**allow["source_thread"], "thread_id": "other"}}
-    assert b.receive_wire(wire, peer="p").reason == "absender_unbelegt"          # wrong thread
+    assert b.receive_wire(wire, peer="p").reason == "absender_abweichend"        # wrong thread
     assert world.egress == []
     b._peers["p"] = allow
     assert b.receive_wire(wire, peer="p").status == "received"

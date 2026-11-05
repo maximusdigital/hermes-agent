@@ -421,6 +421,7 @@ SEAMS: dict[str, tuple[str, str]] = {
     "tenant": ("gateway/run_thread_context.py", "def build_thread_auth_context"),
     "a2a_admission": ("plugins/platforms/a2a/adapter.py", "def _receive_thread_sync"),
     "a2a_ids": ("plugins/platforms/a2a/tools.py", "def _send_task"),
+    "a2a_ablage": ("plugins/platforms/a2a/protocol.py", "def persist_message"),
     "owner_lease": ("tools/bot_thread_provider.py", "def _active_owner"),
     "egress": ("tools/bot_thread_provider.py", "def _project"),
     "pre_session_hook": ("tools/bot_thread_provider.py", "def _pre_session_hook"),
@@ -1347,8 +1348,13 @@ class OutboundStateMachine(_Machine):
         reason = self._gate(event, "provider_binding", "tenant", "egress", "sender_edit", "audit")
         if reason:
             return self._block(event, reason)
-        if event.transport == "a2a" and not self.sync.evidence.proven("a2a_ids"):
-            return SyncResult("blocked", "a2a_id_unbelegt", message_id=event.message_id)
+        if not self.sync.journal.verify_writable():
+            return SyncResult("blocked", "audit_fehler", message_id=event.message_id)
+        if event.transport == "a2a":
+            if not self.sync.evidence.proven("a2a_ids"):
+                return SyncResult("blocked", "a2a_id_unbelegt", message_id=event.message_id)
+            if not self.sync.evidence.proven("a2a_ablage"):
+                return SyncResult("blocked", "a2a_ablage_unmaskiert", message_id=event.message_id)
         if _norm(event.source_thread) != _norm(ctx.thread):
             return self._block(event, "owner_abweichend")
         try:
@@ -1381,6 +1387,11 @@ class OutboundStateMachine(_Machine):
         payload = {**asdict(event), "status": "gesendet"}
         sender_payload = {**payload, "spiegel": True}
         try:
+            # The durable audit is the send precondition: an unrecorded message is never projected.
+            self._audit(event, "sent")
+        except OSError:
+            return SyncResult("blocked", "audit_fehler", message_id=event.message_id)
+        try:
             state, ref = self._stage(event, "sender_projection", lambda: self.sync.sender_project(
                 owner, {**sender_payload, "egress_key": egress_key(event.conversation_id, event.message_id,
                                                             "sender_projection", event.source_thread)}))
@@ -1411,7 +1422,6 @@ class OutboundStateMachine(_Machine):
         self.sync.journal.append_once(event.conversation_id, {
             "kind": "bestaetigt", "conversation_id": event.conversation_id, "message_id": event.message_id,
             "spiegel": True, "status": "gesendet", "sender_projection": ref, "masking": event.masking})
-        self._audit(event, "sent")
         return SyncResult("sent", message_id=event.message_id)
 
     def dead_letter_silent(self, event: ThreadEnvelope, reason: str) -> SyncResult:

@@ -231,6 +231,9 @@ def message_agent_tool(target: str = "", message: str = "", task_id: Optional[st
             return _err("adapter_unbelegt: conversational message_agent requires an authenticated ThreadSync")
         try:
             from tools.bot_thread_sync import new_message_id
+            attester = getattr(capability, "attest", None)
+            if callable(attester):
+                attester("message_agent")
             result = capability.send(target=str(target), message=str(message), art="gespraech",
                                      projection_requested=bool(projection_requested), transport="message_agent",
                                      message_id=new_message_id())

@@ -283,7 +283,7 @@ def _conversational_call(label: str, peer: dict, message: str, calling_agent: An
     from tools.bot_thread_sync import new_message_id
     attester = getattr(capability, "attest", None)
     if callable(attester):
-        attester("a2a_ids")
+        attester("a2a_ids", "a2a_ablage")
     result = capability.send(target=label, message=message, transport="a2a", peer_thread=thread, wire_transport=wire,
                              recipient=peer.get("profile") or label, message_id=new_message_id())
     if result.status != "sent":
