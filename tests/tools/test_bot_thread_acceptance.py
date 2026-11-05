@@ -84,7 +84,76 @@ def test_t13_queue_contract_values_are_pinned(tmp_path):
     assert row["attempts"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason="bta R2b Befund: acceptance adapter wiring pending")
-def test_t10_a2a_roundtrip_uses_prepare_task_adapter():
-    """A2A acceptance is kept strict until the adapter can be built from the provider fixture."""
-    pytest.fail("adapter wiring not available in the acceptance fixture")
+def _t10_roundtrip(world, monkeypatch):
+    """A sends via A2A, B dispatches and answers, and A durably recovers that one reply."""
+    import asyncio
+    import concurrent.futures
+    import time
+    from types import SimpleNamespace
+    from plugins.platforms.a2a import protocol
+    from tests.tools import test_bot_thread_provider as provider
+
+    def submit(coro, loop):
+        future = concurrent.futures.Future()
+        future.set_result(asyncio.run(coro))
+        return future
+
+    monkeypatch.setattr("plugins.platforms.a2a.adapter.asyncio.run_coroutine_threadsafe", submit)
+    current = {}
+
+    def post(url, body, headers, timeout):
+        terminal, pending = current["adapter"]._prepare_task(body["params"], "p")
+        assert pending is None
+        return protocol.jsonrpc_result(body["id"], terminal)
+
+    a2a = provider._a2a_world(world, monkeypatch, post)
+    current["adapter"] = provider._receiver_adapter(world, ready=False)
+    a = world.cap("neo")
+    a2a.a2a_call({"agent": "r", "message": "frage alpha-secret"},
+                 agent=SimpleNamespace(_thread_sync_capability=a))
+    conversation_id = a._sync.journal.conversations()[0]
+    question = a._sync.journal.load_projection(conversation_id, next(
+        event["message_id"] for event in a._sync.journal.events(conversation_id)
+        if event.get("kind") == "projection"))
+
+    current["adapter"]._loop = object()
+    b = world.cap("linus", dispatcher=current["adapter"].dispatch_thread_message)
+    b._sync.clock = lambda: time.time() + 30
+    b.recover()
+    asyncio.run(current["adapter"].send(conversation_id, "antwort beta-secret", metadata={"notify": True}))
+    current["adapter"]._completion_pool.shutdown(wait=True)
+    asyncio.run(current["adapter"].events[-1].on_complete("completed"))
+
+    a2 = world.cap("neo")
+    a2._sync.clock = lambda: time.time() + 120
+    assert a2.recover() >= 1
+    return a2, b, conversation_id, question
+
+
+def test_t10_a2a_roundtrip_uses_prepare_task_adapter(world, monkeypatch):
+    a2, b, conversation_id, _question = _t10_roundtrip(world, monkeypatch)
+    assert a2._sync.journal.conversations() == b._sync.journal.conversations() == [conversation_id]
+    for home in world.homes.values():
+        for record in home.rglob("*"):
+            if record.is_file():
+                text = record.read_bytes().decode("utf-8", "replace")
+                assert "alpha-secret" not in text and "beta-secret" not in text
+
+
+@pytest.mark.xfail(strict=True, reason="bta R2c Befund: StopIteration")
+def test_t10_a2a_roundtrip_reply_keeps_question_parent(world, monkeypatch):
+    a2, _b, conversation_id, question = _t10_roundtrip(world, monkeypatch)
+    rows = [event for event in a2._sync.journal.events(conversation_id) if event.get("kind") == "projection"]
+    reply = next(envelope for envelope in
+                 (a2._sync.journal.load_projection(conversation_id, event["message_id"]) for event in rows)
+                 if envelope.parent_message_id)
+    assert reply.parent_message_id == question.message_id
+
+
+@pytest.mark.xfail(strict=True, reason="bta R2c Befund: AssertionError: assert (1 == 2)")
+def test_t10_a2a_roundtrip_projects_each_message_once_per_side(world, monkeypatch):
+    a2, b, conversation_id, _question = _t10_roundtrip(world, monkeypatch)
+    for capability in (a2, b):
+        rows = [event for event in capability._sync.journal.events(conversation_id)
+                if event.get("kind") == "projection"]
+        assert len(rows) == 2 and len({event["message_id"] for event in rows}) == 2
