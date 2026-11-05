@@ -251,12 +251,21 @@ class ThreadSyncCapability:
         if any(row.get("message_id") == message_id for row in self._sync.journal.events(conversation_id)):
             return SyncResult("blocked", "envelope_ungueltig", message_id=message_id)
         parent = self._parent(conversation_id)
-        envelope = ThreadEnvelope(
-            conversation_id=conversation_id, message_id=message_id, parent_message_id=parent,
-            sender=self._ctx.profile, recipient=profile, tenant=self._ctx.tenant,
-            tenant_source="kontext", source_thread=dict(self._ctx.thread), target_thread=thread,
-            text=str(message), transport=transport, art=art if art in {"gespraech", "arbeitsauftrag"} else "gespraech",
-            projection_requested=bool(projection_requested), is_root=parent is None)
+        try:
+            envelope = ThreadEnvelope(
+                conversation_id=conversation_id, message_id=message_id, parent_message_id=parent,
+                sender=self._ctx.profile, recipient=profile, tenant=self._ctx.tenant,
+                tenant_source="kontext", source_thread=dict(self._ctx.thread), target_thread=thread,
+                text=str(message), transport=transport, art=art if art in {"gespraech", "arbeitsauftrag"} else "gespraech",
+                projection_requested=bool(projection_requested), is_root=parent is None)
+        except ValueError:
+            # The adapter owns the envelope contract: record its breach without retaining text or thread data.
+            self._sync.journal.append(conversation_id, {
+                "kind": "audit", "conversation_id": conversation_id, "message_id": message_id,
+                "parent_message_id": parent, "sender": self._ctx.profile, "recipient": profile,
+                "status": "fehlgeschlagen", "reason": "envelope_ungueltig", "vertragsbruch": True,
+            })
+            return SyncResult("blocked", "envelope_ungueltig", message_id=message_id)
         # Route, projections, transport and terminal journal state are one authorized
         # operation. Nested journal/egress gates use the broker's RLock. Revocation
         # therefore wins before this transaction or waits until its outcome is durable.

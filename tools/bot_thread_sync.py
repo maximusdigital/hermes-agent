@@ -1387,8 +1387,8 @@ class OutboundStateMachine(_Machine):
         payload = {**asdict(event), "status": "gesendet"}
         sender_payload = {**payload, "spiegel": True}
         try:
-            # The durable audit is the send precondition: an unrecorded message is never projected.
-            self._audit(event, "sent")
+            # The audit write is a precondition, but only records queueing until transport confirms delivery.
+            self._audit(event, "eingereiht")
         except OSError:
             return SyncResult("blocked", "audit_fehler", message_id=event.message_id)
         try:
@@ -1422,6 +1422,7 @@ class OutboundStateMachine(_Machine):
         self.sync.journal.append_once(event.conversation_id, {
             "kind": "bestaetigt", "conversation_id": event.conversation_id, "message_id": event.message_id,
             "spiegel": True, "status": "gesendet", "sender_projection": ref, "masking": event.masking})
+        self._audit(event, "sent")
         return SyncResult("sent", message_id=event.message_id)
 
     def dead_letter_silent(self, event: ThreadEnvelope, reason: str) -> SyncResult:
