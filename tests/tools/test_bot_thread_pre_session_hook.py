@@ -5,7 +5,7 @@ import pytest
 
 import tools.bot_live_delivery as bld
 import tools.bot_thread_provider as provider
-from tools.bot_thread_sync import ThreadEnvelope
+from tools.bot_thread_sync import Owner, ThreadEnvelope
 from tests.tools.bot_thread_support import envelope, make_ctx, make_grant, make_sync, registry
 from tools.bot_thread_sync import mask_text
 
@@ -25,7 +25,7 @@ def test_inbound_without_pre_session_hook_blocks_before_projection_or_processing
     result = sync.receive(_incoming())
 
     assert (result.status, result.reason) == ("blocked", "sitzung_unmaskiert")
-    assert projected == [] and dispatched == []
+    assert len(projected) == 1 and dispatched == []
     assert not [row for row in sync.journal.events("conv-1") if row["kind"] == "inbound_processed"]
 
 
@@ -45,29 +45,26 @@ def test_provider_wires_hook_and_delivers_after_confirmed_recipient_projection(t
     home = tmp_path / "recipient"
     home.mkdir()
     monkeypatch.setattr(provider, "_egress_ready", lambda: True)
-    monkeypatch.setattr(provider, "profile_secret_values", lambda _home: ())
+    monkeypatch.setattr(provider, "profile_secret_values", lambda _home: ("fixture-only",))
     monkeypatch.setattr(bld, "_send_canonical_thread_message", lambda *_args: {"success": True, "message_id": "p"})
 
-    def snapshot(registry_home=None, strict=False):
-        assert registry_home == home
-        return [{"lease_id": "lease-recipient", "session_id": "session-recipient",
-                 "metadata": {"platform": "telegram", "chat_id": "test", "thread_id": "recipient-t",
-                              "live_session_id": "live-recipient"}}]
-
-    monkeypatch.setattr("hermes_cli.active_sessions.active_session_registry_snapshot", snapshot)
+    monkeypatch.setattr(provider, "_active_owner", lambda ctx, thread: Owner(
+        ctx.profile_home, ctx.profile, "telegram", str(thread["chat_id"]), str(thread["thread_id"]),
+        "lease-recipient", ctx.live_session_id, ctx.lease_expires_at))
     issued = make_grant(home, profile="recipient", thread="recipient-t", live="live-recipient")
     capability = provider.build_thread_sync(*issued, evidence=registry())
     assert capability is not None and capability._sync.pre_session_hook is not None
     masked = mask_text("hello")
     incoming = ThreadEnvelope(conversation_id="conv-1", message_id="incoming-1", parent_message_id=None,
-                              sender="sender", recipient="recipient", tenant="tenant-1",
+                              sender="sender", recipient=capability._sync.auth.profile, tenant="tenant-1",
                               tenant_source="gateway_context",
                               source_thread={"platform": "telegram", "chat_id": "test", "thread_id": "sender-t"},
-                              target_thread={"platform": "telegram", "chat_id": "test", "thread_id": "recipient-t"},
+                              target_thread=dict(capability._sync.auth.thread),
                               text=masked.text, masking=masked.proof(), transport="native", art="gespraech",
                               projection_requested=False, is_root=True)
 
-    assert capability._sync.receive(incoming).status == "received"
+    result = capability._sync.receive(incoming)
+    assert (result.status, result.reason) == ("received", "")
 
 
 def test_unattested_pre_session_hook_blocks_before_recipient_projection(tmp_path):

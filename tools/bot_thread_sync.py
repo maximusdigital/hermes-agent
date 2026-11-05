@@ -399,6 +399,7 @@ SEAMS: dict[str, tuple[str, str]] = {
     "a2a_ids": ("plugins/platforms/a2a/tools.py", "def _send_task"),
     "owner_lease": ("tools/bot_thread_provider.py", "def _active_owner"),
     "egress": ("tools/bot_thread_provider.py", "def _project"),
+    "pre_session_hook": ("tools/bot_thread_provider.py", "def _pre_session_hook"),
     "sender_edit": ("tools/bot_thread_provider.py", "def _edit_projection"),
     "audit": ("tools/bot_thread_sync.py", "def _audit"),
 }
@@ -1398,7 +1399,7 @@ class InboundStateMachine(_Machine):
     def receive(self, event: ThreadEnvelope, *, force: bool = False, external_dispatch: bool = False) -> SyncResult:
         """Validate/authenticate BEFORE any persistence, then project under the recipient owner."""
         kind = "external" if external_dispatch else "local"
-        reason = self._gate(event, "provider_binding", "tenant", "egress", "audit",
+        reason = self._gate(event, "provider_binding", "tenant", "egress", "pre_session_hook", "audit",
                             *(("a2a_admission",) if event.transport == "a2a" else ()))
         if reason:
             return SyncResult("blocked", reason, message_id=event.message_id)
@@ -1443,13 +1444,15 @@ class InboundStateMachine(_Machine):
                 return SyncResult("queued", "in_bearbeitung", message_id=event.message_id)
             if state == "ambiguous":
                 return self._block(event, "eingangsprojektion_unbestatigt")
+            if self.sync.pre_session_hook is None:
+                return self._block(event, "sitzung_unmaskiert")
             if True:  # atomic: exactly one receipt per message even for concurrent exact replays
                 self.sync.journal.append_once(event.conversation_id, {
                     "kind": "inbound_receipt", "conversation_id": event.conversation_id,
                     "message_id": event.message_id, "parent_message_id": event.parent_message_id,
                     "recipient_projection": ref, "status": "empfangen",
                     "masking": event.masking})
-            if self.sync.pre_session_hook is not None and not self.sync.pre_session_hook({**payload, "text": ""}):
+            if not self.sync.pre_session_hook({**payload, "text": ""}):
                 self._queue(event, "in", "eingangsprojektion_unbestatigt", 0, prior, dispatch=kind)
                 return SyncResult("queued", "eingangsprojektion_unbestatigt", message_id=event.message_id)
             if external_dispatch:

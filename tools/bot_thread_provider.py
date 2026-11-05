@@ -719,6 +719,16 @@ def default_callbacks() -> dict[str, Any]:
             "egress_ready": lambda: _egress_ready()}
 
 
+def _pre_session_hook(sync: ThreadSync, payload: dict[str, Any]) -> bool:
+    """Admit a recipient session only after its exact inbound projection is durable."""
+    conversation_id, message_id = payload.get("conversation_id"), payload.get("message_id")
+    if not isinstance(conversation_id, str) or not isinstance(message_id, str):
+        return False
+    return any(row.get("kind") == "inbound_receipt" and row.get("message_id") == message_id
+               and bool(row.get("recipient_projection"))
+               for row in sync.journal.events(conversation_id))
+
+
 def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
                       evidence=None, peers: dict | None = None, dispatcher: Any = None,
                       native_runner: Any = None, refresh: Any = None) -> ThreadSyncCapability | None:
@@ -813,6 +823,8 @@ def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
         dispatch_gate=lambda event: broker.operation(grant, defer_revoke=True)
         if event.transport == "a2a" else contextlib.nullcontext(),
     )
+    sync.pre_session_hook = lambda payload: _pre_session_hook(sync, payload)
+    sync.attest("pre_session_hook")
     capability = ThreadSyncCapability(ctx, sync)
     capability._refresh = refresh
     if native_runner is not None and callable(refresh):  # no refresh/finalization path → the model is never run
