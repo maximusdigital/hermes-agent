@@ -20,7 +20,7 @@ from tools import pinned_fs
 from tools.bot_thread_authority import GrantBroker
 from tools.bot_thread_sync import (
     AuthorityLost, GatewayAuthContext, Journal, dispatch_key, Owner, SyncResult, ThreadEnvelope, ThreadSync, _valid_message_id, derive_storage_key, mask_text,
-    profile_secret_values,
+    profile_secret_values, _ist,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,7 +219,7 @@ class ThreadSyncCapability:
 
     def _parent(self, conversation_id: str) -> str | None:
         rows = [r for r in self._sync.journal.events(conversation_id)
-                if r.get("kind") in {"outbound_done", "inbound_receipt"}]
+                if _ist(r, "bestaetigt") or r.get("kind") == "inbound_receipt"]
         return str(rows[-1]["message_id"]) if rows else None
 
     @_requires_authority(_blocked)
@@ -473,7 +473,7 @@ class ThreadSyncCapability:
         # Stable reply identity: a re-run of the model (ambiguous crash) can never create a second
         # visible reply projection; the first durable reply wins and is returned again.
         reply_id = _reply_id(inbound.conversation_id, inbound.message_id, self._ctx.profile)
-        if any(e.get("kind") == "outbound_done" and e.get("message_id") == reply_id
+        if any(_ist(e, "bestaetigt") and e.get("message_id") == reply_id
                for e in self._sync.journal.events(inbound.conversation_id)):
             return (SyncResult("sent", message_id=reply_id),
                     self._sync.journal.load_projection(inbound.conversation_id, reply_id))
@@ -511,7 +511,7 @@ class ThreadSyncCapability:
         if inbound.recipient != self._ctx.profile:
             return None
         reply_id = _reply_id(inbound.conversation_id, inbound.message_id, self._ctx.profile)
-        if not any(e.get("kind") == "outbound_done" and e.get("message_id") == reply_id
+        if not any(_ist(e, "bestaetigt") and e.get("message_id") == reply_id
                    for e in self._sync.journal.events(inbound.conversation_id)):
             return None
         return self._sync.journal.load_projection(inbound.conversation_id, reply_id).to_wire()
@@ -532,11 +532,11 @@ class ThreadSyncCapability:
             for r in rows:
                 if r.get("kind") == "reply_poll":
                     polls[r["message_id"]] = polls.get(r["message_id"], 0) + 1
-                if r.get("kind") in {"reply_poll", "outbound_done"}:
+                if r.get("kind") == "reply_poll" or _ist(r, "bestaetigt"):
                     last[r["message_id"]] = float(r.get("at", 0.0))
             for r in rows:
                 mid = r.get("message_id")
-                if r.get("kind") != "outbound_done" or mid in answered or polls.get(mid, 0) >= 8:
+                if not _ist(r, "bestaetigt") or mid in answered or polls.get(mid, 0) >= 8:
                     continue
                 if due_only and self._sync.clock() < last.get(mid, 0.0) + REPLY_POLL_SECONDS * (1 + polls.get(mid, 0)):
                     continue  # bounded, backed-off retrieval
@@ -621,7 +621,7 @@ class ThreadSyncCapability:
         except (TypeError, ValueError):
             return SyncResult("blocked", "envelope_ungueltig")
         mine = {e.get("message_id") for e in self._sync.journal.events(env.conversation_id)
-                if e.get("kind") == "outbound_done"}
+                if _ist(e, "bestaetigt")}
         # A REPLY is the recipient agent's answer to something we sent (its id is the stable reply id of
         # that parent); a follow-up from the peer's agent merely has a parent of ours and must be run.
         if env.parent_message_id in mine and env.message_id == _reply_id(

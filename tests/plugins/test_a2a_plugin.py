@@ -2098,7 +2098,7 @@ class TestConversationalAdmissionAndTransport:
         params = self._params()
         failed, pending = w.adapter._prepare_task(params, "peer")
         assert pending is None and failed["metadata"]["thread_admission"]["status"] == "queued"
-        rows = [e for e in w.sync.journal.events("conv-1") if e["kind"] == "queue"]
+        rows = [e for e in w.sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}]
         assert rows and rows[-1]["dispatch"] == "external" and w.sync.journal.dispatch_state("conv-1", "msg-1") == "PENDING"
         assert w.dispatched == 0
         w.restart()  # gateway restarts with a fresh capability + the adapter as its dispatcher

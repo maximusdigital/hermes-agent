@@ -223,7 +223,7 @@ def test_dead_letter_posts_status_without_text(tmp_path):
     assert sync.send(envelope(text="SENTINEL_BODY")).status == "queued"
     last = None
     for _ in range(12):
-        row = [e for e in sync.journal.events("conv-1") if e["kind"] == "queue"][-1]
+        row = [e for e in sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}][-1]
         res = sync.retry_due(now=row["next_at"] + 1)
         last = res[0] if res else last
         if last and last.status == "dead_letter":
@@ -250,7 +250,7 @@ def test_inbound_queue_recovers_after_restart(tmp_path):
 def test_ttl_measured_from_original_enqueue(tmp_path):
     sync = make_sync(tmp_path, owner_resolver=lambda t: None, sender_project=lambda *_: "x")
     sync.send(envelope())
-    row = [e for e in sync.journal.events("conv-1") if e["kind"] == "queue"][-1]
+    row = [e for e in sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}][-1]
     res = sync.retry_due(now=row["enqueued_at"] + TTL_SECONDS + 1)
     assert (res[0].status, res[0].reason) == ("dead_letter", "ttl_abgelaufen")
 
@@ -377,7 +377,7 @@ def test_next_due_at_reports_earliest_queue_entry(tmp_path):
     sync = make_sync(tmp_path, owner_resolver=lambda t: None, sender_project=lambda *_: "x")
     assert sync.next_due_at() is None
     sync.send(envelope())
-    row = [e for e in sync.journal.events("conv-1") if e["kind"] == "queue"][-1]
+    row = [e for e in sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}][-1]
     assert sync.next_due_at() == row["next_at"]
 
 
@@ -516,7 +516,7 @@ def test_failed_admission_has_no_dispatch_or_journal_side_effects(tmp_path):
 
 
 def _queue_rows(sync):
-    return [e for e in sync.journal.events("conv-1") if e["kind"] == "queue"]
+    return [e for e in sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}]
 
 
 def _mk_inbound(tmp_path, online, proj, **kw):
@@ -573,7 +573,7 @@ def test_admission_durably_enqueues_recipient_dispatch_before_returning_a_ticket
     result = sync.receive(_wire_env(), external_dispatch=True)
     assert result.status == "admitted"
     assert sync.journal.dispatch_state("conv-1", "msg-1") == "PENDING"
-    rows = [e for e in sync.journal.events("conv-1") if e["kind"] == "queue"]
+    rows = [e for e in sync.journal.events("conv-1") if e["kind"] in {"eingereiht", "versuch"}]
     assert len(rows) == 1 and rows[0]["dispatch"] == "external" and rows[0]["direction"] == "in"
     assert not ({"text", "value"} & set(rows[0]))
     from tools.bot_thread_sync import dispatch_key

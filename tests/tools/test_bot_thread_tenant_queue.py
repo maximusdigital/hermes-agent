@@ -43,16 +43,20 @@ def test_legacy_gateway_context_projection_retries_unchanged(tmp_path):
 
 
 def test_new_queue_events_use_contract_names_after_retry_success(tmp_path):
-    up = [0]
+    online, up = [False], [0]
     def transport(_payload):
-        if up[0] < 2:
+        if up[0] < 1:
             up[0] += 1
             raise RuntimeError("offline")
-    sync = make_sync(tmp_path, sender_project=lambda *_: "projected", transport=transport)
+    sync = make_sync(tmp_path, owner_resolver=lambda _thread: None if not online[0] else None,
+                     sender_project=lambda *_: "projected", transport=transport)
     assert sync.send(envelope()).status == "queued"
-    row = next(row for row in reversed(sync.journal.events("conv-1")) if row["kind"] == "queue")
+    # Recovery first sees the durable enqueue, then a transport retry, then completion.
+    from tests.tools.bot_thread_support import owner_for
+    sync.owner_resolver = lambda _thread: owner_for(sync.auth)
+    row = next(row for row in reversed(sync.journal.events("conv-1")) if row["kind"] in {"eingereiht", "versuch"})
     assert sync.retry_due(now=row["next_at"] + 1)[0].status == "queued"
-    row = next(row for row in reversed(sync.journal.events("conv-1")) if row["kind"] == "queue")
+    row = next(row for row in reversed(sync.journal.events("conv-1")) if row["kind"] in {"eingereiht", "versuch"})
     assert sync.retry_due(now=row["next_at"] + 1)[0].status == "sent"
     kinds = [row["kind"] for row in sync.journal.events("conv-1")]
     assert {"eingereiht", "versuch", "bestaetigt"} <= set(kinds)

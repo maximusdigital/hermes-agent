@@ -56,7 +56,7 @@ def test_t3_sender_rejects_unbacked_receipt_ids(world, monkeypatch):
     conv, rows = cap._sync.journal.conversations()[0], None
     rows = cap._sync.journal.events(conv)
     assert [(r["kind"], r.get("reason")) for r in rows if r["kind"] == "dead_letter"] == [("dead_letter", "a2a_id_unbelegt")]
-    assert not [r for r in rows if r["kind"] == "queue"]
+    assert not [r for r in rows if r["kind"] in {"eingereiht", "versuch"}]
     assert len([r for r in rows if r["kind"] == "projection"]) == 1
     assert len([r for r in rows if r["kind"] == "sender_status" and r["status"] == "fehlgeschlagen"]) == 1
 
@@ -97,4 +97,4 @@ def test_t7_missing_admission_receipt_stays_retryable(world, monkeypatch):
     out = tools.a2a_call({"agent": "r", "message": "hallo"}, agent=SimpleNamespace(_thread_sync_capability=cap))
     assert "queued" in out
     conv = cap._sync.journal.conversations()[0]
-    assert any(r["kind"] == "queue" and r["reason"] == "transport_unavailable" for r in cap._sync.journal.events(conv))
+    assert any(r["kind"] in {"eingereiht", "versuch"} and r["reason"] == "transport_unavailable" for r in cap._sync.journal.events(conv))

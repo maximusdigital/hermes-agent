@@ -294,6 +294,16 @@ class Owner:
 
 _PAYLOAD_ONLY_KEYS = frozenset({"egress_key", "sender_projection_id"})  # machine-payload extras, never persisted
 _LEGACY_TENANT_SOURCES = {"gateway_context": "kontext"}
+_ALTNAMEN = {"outbound_done": "bestaetigt"}
+
+
+def _ist(row: dict[str, Any], *kinds: str) -> bool:
+    """Read queue history through the contract names, including durable legacy rows."""
+    kind = str(row.get("kind") or "")
+    if kind == "queue":
+        kind = "versuch" if int(row.get("attempts", 0)) > 0 else "eingereiht"
+    kind = _ALTNAMEN.get(kind, kind)
+    return kind in kinds
 
 
 def _tenant_source_equivalent(source: str | None) -> str | None:
@@ -1245,7 +1255,7 @@ class _Machine:
                dispatch: str = "local") -> None:
         now = self.sync.clock()
         self.sync.journal.append(event.conversation_id, {
-            "kind": "queue", "direction": direction, "conversation_id": event.conversation_id,
+            "kind": "eingereiht" if attempts == 0 else "versuch", "direction": direction, "conversation_id": event.conversation_id,
             "message_id": event.message_id, "attempts": attempts, "reason": reason,
             "dispatch": dispatch,  # how recovery must hand the message on; a type, never content
             "dispatch_kind": event.transport,  # a2a | message_agent: which recipient dispatcher is required
@@ -1324,10 +1334,10 @@ class OutboundStateMachine(_Machine):
 
     def send(self, event: ThreadEnvelope, *, force: bool = False, canonical: bool = False) -> SyncResult:
         existing = self.sync.journal.events(event.conversation_id)
-        prior = next((r for r in reversed(existing) if r.get("kind") == "queue"
+        prior = next((r for r in reversed(existing) if _ist(r, "eingereiht", "versuch")
                       and r.get("message_id") == event.message_id), None)
         if event.is_root is False and not any(r.get("message_id") == event.parent_message_id and r.get("kind") in
-                                              {"outbound_done", "inbound_receipt"} for r in existing):
+                                              {"inbound_receipt"} or _ist(r, "bestaetigt") for r in existing):
             return self._block(event, "parent_unbekannt")
         if event.art == "arbeitsauftrag" and not event.projection_requested:
             return SyncResult("ignored", "arbeitsauftrag_ohne_projektion", message_id=event.message_id)
@@ -1351,7 +1361,7 @@ class OutboundStateMachine(_Machine):
         event, refused = self._canonical(event)  # FIRST: identity is validated before any idempotent shortcut
         if refused is not None:
             return refused
-        if any(r.get("kind") == "outbound_done" and r.get("message_id") == event.message_id for r in existing):
+        if any(_ist(r, "bestaetigt") and r.get("message_id") == event.message_id for r in existing):
             return SyncResult("sent", message_id=event.message_id)
         if any(r.get("kind") == "dead_letter" and r.get("message_id") == event.message_id for r in existing):
             return SyncResult("dead_letter", "bereits_fehlgeschlagen", message_id=event.message_id)
@@ -1399,7 +1409,7 @@ class OutboundStateMachine(_Machine):
             self._queue(event, "out", reason, attempts, prior)
             return SyncResult("queued", reason, attempts, event.message_id)
         self.sync.journal.append_once(event.conversation_id, {
-            "kind": "outbound_done", "conversation_id": event.conversation_id, "message_id": event.message_id,
+            "kind": "bestaetigt", "conversation_id": event.conversation_id, "message_id": event.message_id,
             "spiegel": True, "status": "gesendet", "sender_projection": ref, "masking": event.masking})
         self._audit(event, "sent")
         return SyncResult("sent", message_id=event.message_id)
@@ -1439,7 +1449,7 @@ class InboundStateMachine(_Machine):
         existing = self.sync.journal.events(event.conversation_id)
         if any(r.get("kind") == "inbound_processed" and r.get("message_id") == event.message_id for r in existing):
             return SyncResult("duplicate", "bereits_verarbeitet", message_id=event.message_id)
-        prior = next((r for r in reversed(existing) if r.get("kind") == "queue" and r.get("direction") == "in"
+        prior = next((r for r in reversed(existing) if _ist(r, "eingereiht", "versuch") and r.get("direction") == "in"
                       and r.get("message_id") == event.message_id), None)
         owner, bad = self._owner(event.target_thread)
         if bad == "owner_mehrdeutig" or bad == "owner_abweichend":
@@ -1739,9 +1749,9 @@ class ThreadSync:
             except ValueError:
                 continue
             terminal = {r.get("message_id") for r in rows
-                        if r.get("kind") in {"outbound_done", "dead_letter", "inbound_processed"}}
+                        if _ist(r, "bestaetigt") or r.get("kind") in {"dead_letter", "inbound_processed"}}
             latest = {str(r["message_id"]): r for r in rows
-                      if r.get("kind") == "queue" and r.get("message_id") not in terminal}
+                      if _ist(r, "eingereiht", "versuch") and r.get("message_id") not in terminal}
             for message_id, row in latest.items():
                 if float(row.get("next_at", now + 1)) > now:
                     continue
@@ -1781,9 +1791,9 @@ class ThreadSync:
             except ValueError:
                 continue
             terminal = {r.get("message_id") for r in rows
-                        if r.get("kind") in {"outbound_done", "dead_letter", "inbound_processed"}}
+                        if _ist(r, "bestaetigt") or r.get("kind") in {"dead_letter", "inbound_processed"}}
             latest = {str(r["message_id"]): r for r in rows
-                      if r.get("kind") == "queue" and r.get("message_id") not in terminal}
+                      if _ist(r, "eingereiht", "versuch") and r.get("message_id") not in terminal}
             due.extend(float(r.get("next_at", 0)) for r in latest.values())
         return min(due) if due else None
 

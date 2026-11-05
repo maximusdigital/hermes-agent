@@ -87,7 +87,7 @@ def world(tmp_path, monkeypatch):
 
 def _chain(capability):
     rows = [e for e in capability._sync.journal.events(next(iter(capability._sync.journal.conversations())))
-            if e["kind"] in {"outbound_done", "inbound_receipt"}]
+            if e["kind"] in {"bestaetigt", "inbound_receipt"}]
     return [(e["kind"], e["message_id"]) for e in rows]
 
 
@@ -295,7 +295,7 @@ def test_reply_is_masked_with_receiver_secrets_and_keeps_chain(world):
 def _queued(capability):
     j = capability._sync.journal
     conv = j.conversations()[0]
-    row = [e for e in j.events(conv) if e["kind"] == "queue"][-1]
+    row = [e for e in j.events(conv) if e["kind"] in {"eingereiht", "versuch"}][-1]
     return conv, row["message_id"]
 
 
@@ -534,15 +534,15 @@ def test_sender_is_done_only_with_the_recipients_durable_admission_receipt(world
 
     t = _a2a_world(world, monkeypatch, post)
     out = t.a2a_call({"agent": "r", "message": "hallo"}, agent=SimpleNamespace(_thread_sync_capability=a))
-    assert "queued" in out and "outbound_done" not in _journal_kinds(a)  # NOT falsely sent
+    assert "queued" in out and "bestaetigt" not in _journal_kinds(a)  # NOT falsely sent
     assert seen == []  # the recipient never saw it
 
     mode["v"] = "queued"
     a2 = world.cap("neo")  # sender restart: delivery is rebuilt from the durable route
     a2._sync.clock = lambda: time.time() + 30
     a2.recover()
-    assert "outbound_done" in _journal_kinds(a2) and seen == ["admitted"]
-    rows = [e for e in b._sync.journal.events(b._sync.journal.conversations()[0]) if e["kind"] == "queue"]
+    assert "bestaetigt" in _journal_kinds(a2) and seen == ["admitted"]
+    rows = [e for e in b._sync.journal.events(b._sync.journal.conversations()[0]) if e["kind"] in {"eingereiht", "versuch"}]
     assert rows and rows[-1]["dispatch"] == "external"  # recipient holds a durable queue entry
 
     got = []
@@ -564,7 +564,7 @@ def test_route_or_reply_failure_does_not_report_sent(world, monkeypatch):
 
     t = _a2a_world(world, monkeypatch, post)
     out = t.a2a_call({"agent": "r", "message": "hallo"}, agent=SimpleNamespace(_thread_sync_capability=a))
-    assert "queued" in out and "outbound_done" not in _journal_kinds(a)
+    assert "queued" in out and "bestaetigt" not in _journal_kinds(a)
 
 
 # ---------------------------------------------------------------- crash contract: replies and recovered completion
@@ -673,7 +673,7 @@ def test_sender_retry_across_destroyed_instances_receives_the_durable_reply_exac
     adapter1 = current["adapter"] = _receiver_adapter(world, ready=False)
     a = world.cap("neo")
     out = t.a2a_call({"agent": "r", "message": "hallo"}, agent=SimpleNamespace(_thread_sync_capability=a))
-    assert "recipient holds the message durably" in out and "outbound_done" in _journal_kinds(a)
+    assert "recipient holds the message durably" in out and "bestaetigt" in _journal_kinds(a)
     assert len(a.pending_replies()) == 1  # reply outstanding, tracked durably in the sender journal
     conv = a._sync.journal.conversations()[0]
     # 2. the receiver gateway comes up: recovery SCHEDULES the model; the model answers; completion fires
@@ -722,7 +722,7 @@ def test_disconnect_before_completion_is_lifecycle_not_a_reply_and_work_stays_re
     asyncio.run(adapter.events[-1].on_complete("completed"))  # a late gateway callback must not terminalize
     reader = world.cap("linus")
     assert reader.reply_for(wire) is None  # no reply envelope, no stable reply
-    assert "inbound_processed" not in _journal_kinds(reader) and "outbound_done" not in _journal_kinds(reader)
+    assert "inbound_processed" not in _journal_kinds(reader) and "bestaetigt" not in _journal_kinds(reader)
     assert b2._sync.journal.dispatch_state("conv-1", "msg-1") == "ACCEPTED"  # nonterminal, recoverable
     assert not [t for t in _texts(world, "linus-t") if t.startswith("linus → neo:")]  # nothing projected
     assert adapter._pending == {} and adapter._completion_pool is None
@@ -772,7 +772,7 @@ def test_waiter_timeout_detaches_without_a_reply_and_the_late_genuine_reply_fina
     state, text = adapter._finalize_task(pending, *adapter._await_reply(pending))  # the HTTP waiter gives up
     assert state == protocol.STATE_FAILED and "did not reply" in text  # transport status for the caller only
     reader = world.cap("linus")
-    assert reader.reply_for(wire) is None and "outbound_done" not in _journal_kinds(reader)
+    assert reader.reply_for(wire) is None and "bestaetigt" not in _journal_kinds(reader)
     assert pending["task_id"] in adapter._pending  # waiter detached; the work item was not replaced
     assert adapter.tasks.get(pending["task_id"])["state"] == protocol.STATE_WORKING
     assert not [t for t in _texts(world, "linus-t") if t.startswith("linus → neo:")]
@@ -807,7 +807,7 @@ def test_native_dispatch_kind_is_persisted_in_the_queue_row(world):
     b = world.cap("linus")
     b.ingest_inbox()
     j = b._sync.journal
-    row = [e for e in j.events(j.conversations()[0]) if e["kind"] == "queue"][-1]
+    row = [e for e in j.events(j.conversations()[0]) if e["kind"] in {"eingereiht", "versuch"}][-1]
     assert (row["dispatch"], row["dispatch_kind"]) == ("external", "message_agent")
     assert not ({"text", "value"} & set(row))
 
@@ -850,7 +850,7 @@ def test_live_task_shutdown_is_typed_lifecycle_binding_retained_and_restart_yiel
     assert not [m for m in persisted if m.get("role") == "agent"]  # no task reply persisted
     assert adapter.tasks.get(task_id)["state"] != protocol.STATE_COMPLETED
     reader = world.cap("linus")
-    assert reader.reply_for(wire) is None and "outbound_done" not in _journal_kinds(reader)
+    assert reader.reply_for(wire) is None and "bestaetigt" not in _journal_kinds(reader)
     assert reader._sync.journal.dispatch_state("conv-1", "msg-1") == "ACCEPTED"  # recoverable, nonterminal
     assert not any(marker in json.dumps(persisted) for marker in SYNTHETIC)
     _assert_no_synthetic(world)
@@ -905,7 +905,7 @@ def test_streaming_client_disconnect_is_typed_nonterminal_and_the_late_genuine_r
     assert adapter.tasks.get(task_id)["state"] == protocol.STATE_WORKING
     assert not [m for m in protocol.load_conversation("conv-1", limit=50) if m.get("role") == "agent"]
     reader = world.cap("linus")
-    assert reader.reply_for(wire) is None and "outbound_done" not in _journal_kinds(reader)
+    assert reader.reply_for(wire) is None and "bestaetigt" not in _journal_kinds(reader)
     assert reader._sync.journal.dispatch_state("conv-1", "msg-1") == "ACCEPTED"
     _assert_no_synthetic(world)
     asyncio.run(adapter.send("conv-1", "echte antwort beta-secret", metadata={"notify": True}))  # model finishes
@@ -1225,7 +1225,7 @@ def _reply_crash(world, monkeypatch, boundary):
         marks = {"claim_sender": b'"stage": "sender_projection"' in data and b'"kind": "claim"' in data,
                  "intent_sender": b'"stage": "sender_projection"' in data and b'"kind": "stage_intent"' in data,
                  "done_sender": b'"stage": "sender_projection"' in data and b'"kind": "stage_done"' in data,
-                 "outbound_done": b'"kind": "outbound_done"' in data}
+                 "bestaetigt": b'"kind": "bestaetigt"' in data}
         if marks.get(boundary):
             raise _Crash()
         return real_append(fd, name, data, **kw)
@@ -1244,7 +1244,7 @@ def _reply_crash(world, monkeypatch, boundary):
 
 @pytest.mark.parametrize("boundary,finalizable", [
     ("claim_sender", True), ("intent_sender", False), ("done_sender", False),
-    ("outbound_done", True), ("before_finalize_reply", True)])
+    ("bestaetigt", True), ("before_finalize_reply", True)])
 def test_crash_at_each_reply_boundary_never_reruns_the_model(world, monkeypatch, boundary, finalizable):
     from plugins.platforms.a2a import adapter as _a  # noqa: F401
     adapter, wire, params = _reply_crash(world, monkeypatch, boundary)
