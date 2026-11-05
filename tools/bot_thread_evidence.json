@@ -1,10 +1,10 @@
 {
   "schema_version": 2,
-  "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+  "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
   "entries": {
     "message_agent": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "tools/bot_mode_dm.py:64",
       "file": "tools/bot_mode_dm.py",
@@ -14,17 +14,17 @@
     },
     "provider_binding": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
-      "location": "tools/bot_thread_provider.py:721",
+      "location": "tools/bot_thread_provider.py:722",
       "file": "tools/bot_thread_provider.py",
-      "line": 721,
+      "line": 722,
       "seam": "def build_thread_sync",
-      "sha256": "8c97d5943d76b81267bcae1fba677857ed4ae2621cf4f3ec962189a8db378010"
+      "sha256": "8f07068ba1c01a8700a9657269afc5bf8020d6a57938a2323269e5aaa3cf6b8d"
     },
     "tenant": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "gateway/run_thread_context.py:63",
       "file": "gateway/run_thread_context.py",
@@ -34,7 +34,7 @@
     },
     "a2a_admission": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "plugins/platforms/a2a/adapter.py:634",
       "file": "plugins/platforms/a2a/adapter.py",
@@ -44,7 +44,7 @@
     },
     "a2a_ids": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "plugins/platforms/a2a/tools.py:98",
       "file": "plugins/platforms/a2a/tools.py",
@@ -54,37 +54,37 @@
     },
     "owner_lease": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "tools/bot_thread_provider.py:32",
       "file": "tools/bot_thread_provider.py",
       "line": 32,
       "seam": "def _active_owner",
-      "sha256": "8c97d5943d76b81267bcae1fba677857ed4ae2621cf4f3ec962189a8db378010"
+      "sha256": "8f07068ba1c01a8700a9657269afc5bf8020d6a57938a2323269e5aaa3cf6b8d"
     },
     "egress": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
-      "location": "tools/bot_thread_provider.py:54",
+      "location": "tools/bot_thread_provider.py:55",
       "file": "tools/bot_thread_provider.py",
-      "line": 54,
+      "line": 55,
       "seam": "def _project",
-      "sha256": "8c97d5943d76b81267bcae1fba677857ed4ae2621cf4f3ec962189a8db378010"
+      "sha256": "8f07068ba1c01a8700a9657269afc5bf8020d6a57938a2323269e5aaa3cf6b8d"
     },
     "sender_edit": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
-      "location": "tools/bot_thread_provider.py:87",
+      "location": "tools/bot_thread_provider.py:88",
       "file": "tools/bot_thread_provider.py",
-      "line": 87,
+      "line": 88,
       "seam": "def _edit_projection",
-      "sha256": "8c97d5943d76b81267bcae1fba677857ed4ae2621cf4f3ec962189a8db378010"
+      "sha256": "8f07068ba1c01a8700a9657269afc5bf8020d6a57938a2323269e5aaa3cf6b8d"
     },
     "audit": {
       "proven": true,
-      "revision": "artifact:30be019dd2843c96d1a125770b8a7fb424301c28324ae07f2695a64813899246",
+      "revision": "artifact:59d0589f4888a7752a7a4e719ddb82592f81f826b17eee26376157b2b9a50849",
       "kind": "Code",
       "location": "tools/bot_thread_sync.py:403",
       "file": "tools/bot_thread_sync.py",

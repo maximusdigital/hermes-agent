@@ -29,22 +29,23 @@ INBOX_PARTS = ("runtime", "bot_thread_sync_inbox")
 EGRESS_PARTS = ("runtime", "bot_thread_sync_egress")
 
 
-def _active_owner(ctx: GatewayAuthContext, thread: dict[str, Any]) -> Owner | None:
-    """Exactly one live registry row for the thread; lease expiry is the context's, never synthesized."""
+def _active_owner(ctx: GatewayAuthContext, thread: dict[str, Any]) -> Owner | list[Owner] | None:
+    """Resolve no owner, one owner, or an ambiguous set; lease expiry stays context-bound."""
     from hermes_cli.active_sessions import active_session_registry_snapshot
     home = Path(ctx.profile_home)
     rows = [e for e in active_session_registry_snapshot(registry_home=home, strict=True)
             if str((e.get("metadata") or {}).get("platform") or "") == "telegram"
             and str((e.get("metadata") or {}).get("chat_id") or "") == str(thread.get("chat_id"))
             and str((e.get("metadata") or {}).get("thread_id") or "") == str(thread.get("thread_id"))]
-    if len(rows) != 1:
+    if not rows:
         return None
-    entry = rows[0]
-    return Owner(profile_home=str(home), profile=ctx.profile, platform="telegram",
-                 chat_id=str(thread["chat_id"]), thread_id=str(thread["thread_id"]),
-                 lease_id=str(entry.get("lease_id") or ""),
-                 live_session_id=str((entry.get("metadata") or {}).get("live_session_id") or ""),
-                 lease_expires_at=ctx.lease_expires_at)
+    owners = [Owner(profile_home=str(home), profile=ctx.profile, platform="telegram",
+                    chat_id=str(thread["chat_id"]), thread_id=str(thread["thread_id"]),
+                    lease_id=str(entry.get("lease_id") or ""),
+                    live_session_id=str((entry.get("metadata") or {}).get("live_session_id") or ""),
+                    lease_expires_at=ctx.lease_expires_at)
+              for entry in rows]
+    return owners[0] if len(owners) == 1 else owners
 
 
 def _render(payload: dict[str, Any]) -> str:
@@ -860,7 +861,7 @@ def build_thread_sync(grant: Any, broker: Any, *, service_scope: bool = False,
     sync.attest("provider_binding", "tenant")
     capability._grant, capability._broker, capability._live = grant, broker, live
     owner = cbs["owner_resolver"](ctx, ctx.thread)
-    if owner is not None and owner.valid(time.time()) is None:
+    if isinstance(owner, Owner) and owner.valid(time.time()) is None:
         sync.attest("owner_lease")
     if sync.journal.verify_writable():
         sync.attest("audit")
