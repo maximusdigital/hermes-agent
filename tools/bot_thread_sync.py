@@ -229,7 +229,7 @@ def _valid_message_id(value: Any) -> bool:
         parsed = uuid.UUID(str(value))
     except (AttributeError, TypeError, ValueError):
         return False
-    return parsed.version == 7 and parsed.variant == uuid.RFC_4122 and str(parsed) == str(value).lower()
+    return parsed.version == 7 and parsed.variant == uuid.RFC_4122 and str(parsed) == str(value)
 
 
 @dataclass(frozen=True)
@@ -1371,6 +1371,9 @@ class OutboundStateMachine(_Machine):
                 if state == "busy":
                     return SyncResult("queued", "in_bearbeitung", message_id=event.message_id)
         except Exception as exc:
+            if str(exc).startswith("a2a_id_unbelegt"):
+                self._audit(event, "Vertragsbruch", "a2a_id_unbelegt")
+                return self.dead_letter(event, "a2a_id_unbelegt", 0)
             reason = "target_busy" if "target_busy" in str(exc) else "transport_unavailable"
             attempts = int(prior.get("attempts", 0)) if prior else 0
             attempts += reason != "target_busy"

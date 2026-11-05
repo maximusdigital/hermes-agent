@@ -147,11 +147,14 @@ def _send_task(agent_label: str, peer: dict, message: str, context_id: str,
         # task state alone (or a transport that merely returned) proves nothing: without it the sender
         # keeps the message queued and retries.
         receipt = (payload.get("metadata") or {}).get("thread_admission") if isinstance(payload, dict) else None
-        if not (isinstance(receipt, dict) and receipt.get("message_id") == envelope.message_id
-                and receipt.get("envelope_digest") == envelope.digest
-                and receipt.get("wire_message_id") == envelope.message_id
-                and receipt.get("wire_context_id") == envelope.conversation_id
-                and receipt.get("status") in {"admitted", "queued", "duplicate"}):
+        if not isinstance(receipt, dict):
+            raise RuntimeError("admission_unbelegt: recipient did not provide an admission receipt")
+        if (receipt.get("message_id") != envelope.message_id
+                or receipt.get("envelope_digest") != envelope.digest
+                or receipt.get("status") not in {"admitted", "queued", "duplicate"}):
+            raise RuntimeError("admission_unbelegt: recipient did not prove durable admission")
+        if (receipt.get("wire_message_id") != envelope.message_id
+                or receipt.get("wire_context_id") != envelope.conversation_id):
             raise ValueError("a2a_id_unbelegt: recipient did not bind the wire ids")
         if admission_sink is not None:
             admission_sink.update(receipt)

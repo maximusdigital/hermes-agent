@@ -238,6 +238,8 @@ class ThreadSyncCapability:
             profile, home, thread = resolved
         if wire_transport is not None:
             self._wire[transport] = wire_transport
+        if transport == "a2a" and not self._sync.evidence.proven("a2a_ids"):
+            return SyncResult("blocked", "a2a_id_unbelegt", message_id=message_id)
         conversation_id = conversation_id_for(self._ctx.tenant, self._ctx.profile, profile)
         if not _valid_message_id(message_id):
             return SyncResult("blocked", "envelope_ungueltig")
