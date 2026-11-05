@@ -140,20 +140,18 @@ def test_t10_a2a_roundtrip_uses_prepare_task_adapter(world, monkeypatch):
                 assert "alpha-secret" not in text and "beta-secret" not in text
 
 
-@pytest.mark.xfail(strict=True, reason="bta R2c Befund: StopIteration")
 def test_t10_a2a_roundtrip_reply_keeps_question_parent(world, monkeypatch):
     a2, _b, conversation_id, question = _t10_roundtrip(world, monkeypatch)
-    rows = [event for event in a2._sync.journal.events(conversation_id) if event.get("kind") == "projection"]
-    reply = next(envelope for envelope in
-                 (a2._sync.journal.load_projection(conversation_id, event["message_id"]) for event in rows)
-                 if envelope.parent_message_id)
-    assert reply.parent_message_id == question.message_id
+    reply = next(event for event in a2._sync.journal.events(conversation_id)
+                 if event.get("kind") == "inbound_receipt"
+                 and event["message_id"] != question.message_id)
+    assert reply["parent_message_id"] == question.message_id
 
 
-@pytest.mark.xfail(strict=True, reason="bta R2c Befund: AssertionError: assert (1 == 2)")
 def test_t10_a2a_roundtrip_projects_each_message_once_per_side(world, monkeypatch):
     a2, b, conversation_id, _question = _t10_roundtrip(world, monkeypatch)
     for capability in (a2, b):
         rows = [event for event in capability._sync.journal.events(conversation_id)
-                if event.get("kind") == "projection"]
+                if event.get("kind") in {"projection", "inbound_receipt"}
+                and (event.get("sender_projection") or event.get("recipient_projection"))]
         assert len(rows) == 2 and len({event["message_id"] for event in rows}) == 2
