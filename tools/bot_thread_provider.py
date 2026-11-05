@@ -250,7 +250,7 @@ class ThreadSyncCapability:
         envelope = ThreadEnvelope(
             conversation_id=conversation_id, message_id=message_id, parent_message_id=parent,
             sender=self._ctx.profile, recipient=profile, tenant=self._ctx.tenant,
-            tenant_source="gateway_context", source_thread=dict(self._ctx.thread), target_thread=thread,
+            tenant_source="kontext", source_thread=dict(self._ctx.thread), target_thread=thread,
             text=str(message), transport=transport, art=art if art in {"gespraech", "arbeitsauftrag"} else "gespraech",
             projection_requested=bool(projection_requested), is_root=parent is None)
         # Route, projections, transport and terminal journal state are one authorized
@@ -488,7 +488,7 @@ class ThreadSyncCapability:
         reply = ThreadEnvelope(
             conversation_id=inbound.conversation_id, message_id=reply_id,
             parent_message_id=inbound.message_id, sender=self._ctx.profile, recipient=inbound.sender,
-            tenant=self._ctx.tenant, tenant_source="gateway_context", source_thread=dict(self._ctx.thread),
+            tenant=self._ctx.tenant, tenant_source="kontext", source_thread=dict(self._ctx.thread),
             target_thread=dict(inbound.source_thread), text=str(text), transport=inbound.transport,
             art="gespraech", projection_requested=True, is_root=False)
         if not is_a2a:  # native: delivery to the original sender is rebuilt from this durable route

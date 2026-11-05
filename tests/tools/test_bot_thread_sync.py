@@ -80,7 +80,7 @@ def test_tenant_comes_from_context_only(tmp_path):
     ok = make_sync(tmp_path, name="b", sender_project=lambda o, p: "r1", transport=lambda p: None)
     assert ok.send(envelope()).status == "sent"
     assert ok.audit("conv-1")[-1]["tenant"] == "tenant-1"
-    assert ok.audit("conv-1")[-1]["tenant_source"] == "gateway_context"
+    assert ok.audit("conv-1")[-1]["tenant_source"] == "kontext"
 
 
 def test_owner_must_match_thread_not_default_same_owner(tmp_path):

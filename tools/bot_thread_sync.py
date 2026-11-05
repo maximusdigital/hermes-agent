@@ -293,6 +293,12 @@ class Owner:
 
 
 _PAYLOAD_ONLY_KEYS = frozenset({"egress_key", "sender_projection_id"})  # machine-payload extras, never persisted
+_LEGACY_TENANT_SOURCES = {"gateway_context": "kontext"}
+
+
+def _tenant_source_equivalent(source: str | None) -> str | None:
+    """Read the former source label as its contract successor without rewriting storage."""
+    return _LEGACY_TENANT_SOURCES.get(source, source)
 
 
 @dataclass(frozen=True)
@@ -352,6 +358,14 @@ class ThreadEnvelope:
     def digest(self) -> str:
         body = json.dumps(asdict(self), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+    @property
+    def replay_digest(self) -> str:
+        """Digest for replay comparison; legacy source spelling is semantically identical."""
+        body = asdict(self)
+        body["tenant_source"] = _tenant_source_equivalent(self.tenant_source)
+        encoded = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
     def to_wire(self) -> dict[str, Any]:
         """Complete envelope plus its integrity digest; the only A2A/native transport form."""
@@ -694,7 +708,7 @@ class Journal:
                 status, stored = self._verified_projection(raw, envelope.conversation_id, envelope.message_id)
                 if stored is None:
                     return "TAMPERED", None
-                return ("EXACT_REPLAY" if stored.digest == envelope.digest else "CONFLICT"), stored
+                return ("EXACT_REPLAY" if stored.replay_digest == envelope.replay_digest else "CONFLICT"), stored
             finally:
                 os.close(proj_fd)
 
@@ -1185,6 +1199,8 @@ class _Machine:
         if event.tenant is not None and event.tenant != ctx.tenant:
             return "tenant_abweichend"
         missing = self.sync.evidence.require(*required)
+        if missing == "tenant":
+            return "tenant_unbekannt"
         return "spiegel_unbelegt" if missing else None
 
     def _owner(self, thread: dict[str, Any]) -> tuple[Owner | None, str | None]:
@@ -1317,7 +1333,7 @@ class OutboundStateMachine(_Machine):
             return SyncResult("ignored", "arbeitsauftrag_ohne_projektion", message_id=event.message_id)
         ctx = self.sync.auth
         if event.tenant is None:  # authority is the authenticated context, never the message
-            event = ThreadEnvelope(**{**asdict(event), "tenant": ctx.tenant, "tenant_source": "gateway_context"})
+            event = ThreadEnvelope(**{**asdict(event), "tenant": ctx.tenant, "tenant_source": "kontext"})
         reason = self._gate(event, "provider_binding", "tenant", "egress", "sender_edit", "audit")
         if reason:
             return self._block(event, reason)
